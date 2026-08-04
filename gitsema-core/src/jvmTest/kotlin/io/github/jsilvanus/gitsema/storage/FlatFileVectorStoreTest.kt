@@ -118,6 +118,50 @@ class FlatFileVectorStoreTest {
     }
 
     @Test
+    fun `a blob stored as several fallback chunks is deduplicated to one hit, its best-scoring chunk`() = runTest {
+        // kotlin-port.md §2.4's context-limit fallback storage: a blob that
+        // couldn't be embedded whole gets one vector_entry row per surviving
+        // chunk, all sharing one blob_hash. search() must still return
+        // exactly one hit for that blob, not one per chunk.
+        val bigBlob = BlobHash("h".repeat(40))
+        val query = deterministicVector("the query text", DIMS)
+        // chunk 1 happens to be a closer match to the query than chunk 0.
+        store.upsert(bigBlob, MODEL, deterministicVector("chunk zero content, unrelated", DIMS), chunkIndex = 0)
+        store.upsert(bigBlob, MODEL, query, chunkIndex = 1) // identical to the query -> highest possible score
+        store.upsert(BlobHash("other".padEnd(40, '0')), MODEL, deterministicVector("something else", DIMS), chunkIndex = null)
+
+        val hits = store.search(MODEL, query, topK = 10)
+
+        val bigBlobHits = hits.filter { it.blobHash == bigBlob }
+        assertEquals(1, bigBlobHits.size, "the blob's two chunks must collapse into a single hit")
+        assertTrue(bigBlobHits.single().score > 0.99, "the hit should carry chunk 1's (the better match's) score")
+    }
+
+    @Test
+    fun `chunk-fallback records for the same blob are independently addressable and idempotent`() = runTest {
+        val hash = BlobHash("i".repeat(40))
+        store.upsert(hash, MODEL, deterministicVector("chunk 0", DIMS), chunkIndex = 0)
+        store.upsert(hash, MODEL, deterministicVector("chunk 1", DIMS), chunkIndex = 1)
+        store.upsert(hash, MODEL, deterministicVector("chunk 0 -- retried, must not duplicate", DIMS), chunkIndex = 0)
+
+        assertTrue(store.isIndexed(hash, MODEL))
+        // Both chunks plus the blob overall should still count as ONE indexed blob.
+        assertEquals(1L, store.countForModel(MODEL))
+    }
+
+    @Test
+    fun `a blob can have a whole-file vector OR chunk vectors without conflating the two`() = runTest {
+        val whole = BlobHash("j".repeat(40))
+        store.upsert(whole, MODEL, deterministicVector("whole file content", DIMS), chunkIndex = null)
+
+        val chunked = BlobHash("k".repeat(40))
+        store.upsert(chunked, MODEL, deterministicVector("chunk a", DIMS), chunkIndex = 0)
+        store.upsert(chunked, MODEL, deterministicVector("chunk b", DIMS), chunkIndex = 1)
+
+        assertEquals(2L, store.countForModel(MODEL), "one whole-file blob + one chunked blob = 2 distinct blobs, regardless of row count")
+    }
+
+    @Test
     fun `search memory use is bounded by topK, not by the number of stored vectors`() = runTest {
         // Deliverable: "a memory ceiling test on a synthetic large repo"
         // (docs/design/kotlin-port.md). This is necessarily a coarse smoke
