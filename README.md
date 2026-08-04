@@ -4,11 +4,14 @@ A Kotlin Multiplatform (JVM + Android) port of [gitsema](https://github.com/jsil
 indexing and search core, built as a standalone library for
 [Aidos](https://github.com/jsilvanus/aidos).
 
-**Status: Tier 1 complete and operational on the JVM target** — index → search
+**Status: Tier 1 complete and operational on the JVM target; `androidTarget()`
+is wired and compiling, but has never run on a device** — index → search
 through the public API, with commit-mapping, recency ranking, an
 ancestry-aware resume cursor, branch filtering, and the context-limit
 fallback chain all real (not stubbed). Not yet publishable to a real audience
-(still 0.1.0-SNAPSHOT), and `androidTarget()` isn't wired yet — see below.
+(still 0.1.0-SNAPSHOT). What "compiling but unverified" means for the Android
+target specifically is spelled out in [What still needs a
+device](#what-still-needs-a-device) — read that before depending on it.
 
 The full specification — algorithms, constants with their rationale, cost
 profiles, and the decisions behind every departure from gitsema-TS — lives in
@@ -77,7 +80,16 @@ only orients you to what's actually built.
   yet used — see `.github/workflows/publish.yml` (manual `workflow_dispatch`
   only, not on every push).
 
-**96 tests passing** (`jvm` target), covering: chunking determinism (both
+- **Android target**: `androidTarget()` (library, `compileSdk` 34, `minSdk`
+  26, one `release` publication), with `androidMain` holding the only two
+  genuinely Android-specific pieces — the SQLite driver and a JGit
+  configuration guard. Both are documented at their definitions;
+  [What still needs a device](#what-still-needs-a-device) says what remains
+  unproven.
+
+**98 tests passing** (`jvm` target) and **35** (Android `debug`/`release` unit
+tests — `commonTest`'s pure-Kotlin suites compiled against the Android
+variant), covering: chunking determinism (both
 strategies) and coverage/overlap invariants, quantization accuracy/determinism,
 storage idempotency and multi-path blobs, FTS sanitization, vector store
 correctness/dedup/topK-boundedness plus a memory-ceiling smoke test, embedding
@@ -92,13 +104,6 @@ across both the hybrid and degraded FTS-only search paths.
 
 ## What's deliberately not here yet
 
-- **The `androidTarget()` build configuration itself.** The source layout
-  already anticipates it (`jvmAndroidMain` holds everything both targets will
-  share), but this was developed in a sandboxed environment with neither an
-  Android SDK nor network access to Google's Maven repository (confirmed via
-  a direct request, not assumed), so it could not be added and verified
-  honestly. Wiring it is a mechanical follow-up once run somewhere with both
-  available — no `commonMain` or `jvmAndroidMain` code needs to change.
 - **The function chunker** (§2.4's remaining tier). It needs tree-sitter,
   which Decision A in the design doc says not to build on-device without
   asking first. The rest of the fallback chain (whole-file → fixed 1500 →
@@ -117,13 +122,55 @@ A full "what was deliberately not ported and why" note will be written once
 enough of Tier 1/2 exists for it to be a real accounting rather than a
 placeholder — see kotlin-port.md deliverable #4.
 
+## What still needs a device
+
+The Android target compiles, dexes, and runs `commonTest` as JVM-hosted unit
+tests. None of that touches a real Android runtime, and the gap between
+"compiles" and "works" is where this library's Android risk actually lives.
+Everything below was established statically — bytecode, exception tables,
+`android.jar`'s class list — and none of it has run on an emulator or a
+phone. There are no instrumented (`connectedAndroidTest`) tests yet; adding
+them is the first item on this list, not the last.
+
+- **JGit's JMX registration is a real crash, already guarded.** `WindowCache`
+  registers an MBean by default on first packfile read, through classes that
+  do not exist on Android, and JGit catches only the checked exceptions —
+  not the resulting `NoClassDefFoundError`. `configureJGitForAndroid()` in
+  `androidMain` turns it off and **must be called once before any
+  `JGitRepository` is constructed**. That the guard is necessary is
+  established; that it is sufficient is not.
+- **JGit's other platform assumptions.** `FS_POSIX` probes for a system `git`
+  executable (Android has none), and `FileStoreAttributes` measures
+  filesystem timestamp resolution. Both are known hazards on Android and
+  neither is addressed here.
+- **The SQLite driver's path handling.** `createSqlDriver(context, path)`
+  passes an absolute path as the database *name*, relying on
+  `Context.getDatabasePath` resolving it to that exact file. That is AOSP's
+  documented behaviour, asserted rather than observed.
+- **Everything about resource behaviour.** The memory-mapped vector store's
+  page-cache behaviour under Android memory pressure, indexing throughput
+  inside Android's execution windows, and whether the §9.2 brute-force scan
+  is fast enough before any ANN work — all of it is the measurement
+  kotlin-port.md §9.2 point 4 explicitly defers to a real device.
+
 ## Building
 
 ```bash
-./gradlew build   # jvm target only, for now — see "What's deliberately not here yet"
+./gradlew build   # builds and tests both targets: jvm and android
 ```
 
-No Android SDK is required to build or test what currently exists.
+Building the Android target needs an SDK: set `sdk.dir` in
+`local.properties`, or `ANDROID_HOME`, with platform 34 and build-tools
+34.0.0 installed. A machine without one can still do JVM-only work —
+
+```bash
+./gradlew :gitsema-core:jvmTest   # verified to run with no SDK present at all
+```
+
+— it is only the Android tasks that fail. GitHub's `ubuntu-latest` runners
+ship an SDK, so `.github/workflows/publish.yml` needs no change; note that it
+runs `./gradlew build`, which now builds and publishes an `androidRelease`
+variant alongside `jvm`.
 
 ## Publishing
 
