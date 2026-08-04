@@ -1,6 +1,8 @@
 package io.github.jsilvanus.gitsema.indexing
 
 import io.github.jsilvanus.gitsema.chunking.Chunker
+import io.github.jsilvanus.gitsema.chunking.FixedChunker
+import io.github.jsilvanus.gitsema.embedding.ContextLengthExceededException
 import io.github.jsilvanus.gitsema.embedding.EmbedOutcome
 import io.github.jsilvanus.gitsema.embedding.EmbedRequest
 import io.github.jsilvanus.gitsema.embedding.EmbeddingOrchestrator
@@ -44,13 +46,25 @@ import kotlinx.datetime.Clock
  * (§7.2/§8.2), so re-walking never re-embeds anything, only re-visits
  * already-safe ground.
  *
- * Only [io.github.jsilvanus.gitsema.chunking.FileChunker] is wired for
- * embedding in Tier 1 (per the porting brief's "chunking (file strategy
- * first)") — the context-limit fallback chain (kotlin-port.md §2.4: function
- * chunker then fixed 1500/800) needs chunk-level vector storage, which
- * [VectorStore] doesn't support yet (see [io.github.jsilvanus.gitsema.chunking.FixedChunker]'s
- * doc comment); an oversized-context failure is currently just a failed
- * blob, counted in stats, not retried with a smaller chunk.
+ * [io.github.jsilvanus.gitsema.chunking.FileChunker] is the primary
+ * embedding strategy (per the porting brief's "chunking (file strategy
+ * first)"). When a whole-file embed attempt fails specifically with
+ * [ContextLengthExceededException], the context-limit fallback chain
+ * (kotlin-port.md §2.4) kicks in: re-chunk with [FixedChunker] at window
+ * size 1500, then 800, storing one chunk-indexed [VectorStore] record per
+ * surviving sub-chunk only if EVERY sub-chunk at that window size embeds
+ * successfully (matching gitsema-TS: a partial success at one window size
+ * doesn't get kept — it moves to the next, smaller size instead). Not
+ * wired: the function-chunker tier of the real fallback chain (needs
+ * tree-sitter, which the design doc's Decision A says not to build
+ * on-device without asking first) — this port's chain is whole-file → fixed
+ * 1500 → fixed 800 → fail, skipping the function-chunker step entirely.
+ *
+ * Every blob visited while walking [ref] (not just ones needing embedding)
+ * is recorded as seen on that ref via [MetadataStore.addBlobBranch] — see
+ * `BlobBranches.sq` for the precise, deliberately narrower-than-full-git
+ * semantic this claims (indexed-under-this-ref-name, not full branch
+ * topology).
  */
 class Indexer(
     private val repository: GitRepository,
@@ -142,6 +156,13 @@ class Indexer(
             blobsSkipped += batch.size - toEmbed.size
 
             val pathsByHash: Map<BlobHash, RepoPath> = batch.associate { it.blobHash to it.path }
+            // Every blob VISITED this walk is "on" ref, whether or not it
+            // needed embedding -- branch membership and embed-need are
+            // independent questions.
+            for (entry in batch) {
+                metadataStore.addBlobBranch(entry.blobHash, ref)
+            }
+
             val requests = mutableListOf<EmbedRequest>()
             val contentByHash = mutableMapOf<BlobHash, String>()
 
@@ -154,16 +175,17 @@ class Indexer(
                 val text = bytes.decodeToString()
                 val path = pathsByHash.getValue(hash)
                 val chunks = chunker.chunk(text, path.value)
-                // Tier 1 (file chunker): always exactly one chunk. A future
-                // function/fixed chunker would produce more than one here,
-                // each needing its own EmbedRequest keyed distinctly -- not
-                // yet needed since only FileChunker is wired.
+                // Tier 1 (file chunker): always exactly one chunk. On
+                // failure with a context-length cause, the fallback pass
+                // below re-chunks this same content with FixedChunker
+                // instead -- this first attempt is always whole-file.
                 val wholeFileContent = chunks.first().content
                 contentByHash[hash] = wholeFileContent
                 requests += EmbedRequest(id = hash.value, text = wholeFileContent)
             }
 
             val outcomes = orchestrator.embedAll(requests)
+            val needsFallback = mutableListOf<BlobHash>()
             for (outcome in outcomes) {
                 val hash = BlobHash(outcome.id)
                 when (outcome) {
@@ -175,8 +197,24 @@ class Indexer(
                         blobsIndexed++
                     }
                     is EmbedOutcome.Failed -> {
-                        blobsFailed++
+                        if (outcome.cause is ContextLengthExceededException) {
+                            needsFallback += hash
+                        } else {
+                            blobsFailed++
+                        }
                     }
+                }
+            }
+
+            for (hash in needsFallback) {
+                val content = contentByHash.getValue(hash)
+                if (tryFallbackChunking(hash, content)) {
+                    metadataStore.putBlob(hash, size = content.length.toLong(), indexedAtEpochSeconds = clock())
+                    metadataStore.addPath(hash, pathsByHash.getValue(hash))
+                    ftsStore.index(hash, content)
+                    blobsIndexed++
+                } else {
+                    blobsFailed++
                 }
             }
 
@@ -199,5 +237,34 @@ class Indexer(
             blobsFailed = blobsFailed,
             blobsOversized = blobsOversized,
         )
+    }
+
+    /**
+     * The context-limit fallback chain (kotlin-port.md §2.4), whole-file →
+     * fixed 1500 → fixed 800 → fail (function chunker skipped, see the class
+     * doc comment). At each window size, EVERY resulting sub-chunk must
+     * embed successfully before any of them are persisted — a partial
+     * success at 1500 is discarded entirely and 800 is tried fresh, matching
+     * gitsema-TS exactly rather than keeping a partial result. Returns
+     * whether [hash] ended up with vectors stored at all.
+     */
+    private suspend fun tryFallbackChunking(hash: BlobHash, content: String): Boolean {
+        for (windowSize in FALLBACK_WINDOW_SIZES) {
+            val chunks = FixedChunker(windowSize, FALLBACK_OVERLAP).chunk(content, path = "")
+            val requests = chunks.mapIndexed { i, chunk -> EmbedRequest(id = "${hash.value}#$i", text = chunk.content) }
+            val outcomes = orchestrator.embedAll(requests)
+            if (outcomes.size == requests.size && outcomes.all { it is EmbedOutcome.Success }) {
+                outcomes.forEachIndexed { i, outcome ->
+                    vectorStore.upsert(hash, provider.modelId, (outcome as EmbedOutcome.Success).vector, chunkIndex = i)
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    private companion object {
+        val FALLBACK_WINDOW_SIZES = listOf(1500, 800)
+        const val FALLBACK_OVERLAP = 200
     }
 }

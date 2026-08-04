@@ -141,4 +141,35 @@ class SemanticIndexTest {
 
         assertEquals(1, results.size)
     }
+
+    @Test
+    fun `branch filtering restricts hybrid search results to blobs indexed under that ref`() = runTest {
+        val index = buildIndex(mapOf("a.txt" to "unique searchable content about widgets"))
+        index.index("main")
+
+        val onMain = index.search(Query("widgets", topK = 5, branch = "main"))
+        val onOther = index.search(Query("widgets", topK = 5, branch = "never-indexed-branch"))
+        val unfiltered = index.search(Query("widgets", topK = 5))
+
+        assertEquals(1, onMain.size, "the blob was indexed under 'main', so branch=main should find it")
+        assertTrue(onOther.isEmpty(), "no blob was ever indexed under this branch name")
+        assertEquals(1, unfiltered.size, "no branch filter should behave exactly as before")
+    }
+
+    @Test
+    fun `branch filtering also restricts the degraded FTS-only search path`() = runTest {
+        val files = mapOf("auth.txt" to "authentication middleware handles login requests")
+        val database = sharedDatabase()
+        val index = indexOn(database, files)
+        index.index("main")
+        // Same "different, not-yet-vectored model" trick as the degraded-search test above.
+        val partialIndex = indexOn(database, files, FakeEmbeddingProvider(modelId = "a-different-not-yet-indexed-model"))
+
+        val onMain = partialIndex.search(Query("authentication middleware", topK = 5, branch = "main"))
+        val onOther = partialIndex.search(Query("authentication middleware", topK = 5, branch = "never-indexed-branch"))
+
+        assertTrue(onMain.isNotEmpty())
+        assertTrue(onMain.all { it.degraded })
+        assertTrue(onOther.isEmpty())
+    }
 }

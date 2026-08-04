@@ -19,6 +19,7 @@ class SqliteMetadataStore(private val database: GitsemaDatabase) : MetadataStore
     private val commits = database.commitsQueries
     private val embedConfig = database.embedConfigQueries
     private val resumeCursor = database.resumeCursorQueries
+    private val blobBranches = database.blobBranchesQueries
 
     override suspend fun putBlob(blobHash: BlobHash, size: Long, indexedAtEpochSeconds: Long) =
         withContext(Dispatchers.IO) {
@@ -96,5 +97,17 @@ class SqliteMetadataStore(private val database: GitsemaDatabase) : MetadataStore
 
     override suspend fun getResumeCursor(ref: String): CommitHash? = withContext(Dispatchers.IO) {
         resumeCursor.getResumeCursor(ref).executeAsOneOrNull()?.let { CommitHash(it) }
+    }
+
+    override suspend fun addBlobBranch(blobHash: BlobHash, ref: String) = withContext(Dispatchers.IO) {
+        blobBranches.addBlobBranch(blobHash.value, ref)
+    }
+
+    override suspend fun branchesFor(blobHash: BlobHash): List<String> = withContext(Dispatchers.IO) {
+        blobBranches.branchesFor(blobHash.value).executeAsList()
+    }
+
+    override suspend fun blobHashesOnBranch(ref: String): Set<BlobHash> = withContext(Dispatchers.IO) {
+        blobBranches.blobHashesOnBranch(ref).executeAsList().map { BlobHash(it) }.toHashSet()
     }
 }

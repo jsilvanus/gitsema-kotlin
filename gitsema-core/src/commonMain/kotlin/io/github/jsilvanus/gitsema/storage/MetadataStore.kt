@@ -58,4 +58,16 @@ interface MetadataStore {
      */
     suspend fun setResumeCursor(ref: String, commitHash: CommitHash)
     suspend fun getResumeCursor(ref: String): CommitHash?
+
+    /**
+     * Records that [blobHash] was seen while indexing under [ref] — see the
+     * precise semantic note on `blob_branch_entry` in `BlobBranches.sq`:
+     * this means "visited while indexing this ref by name," not full git
+     * branch-topology membership.
+     */
+    suspend fun addBlobBranch(blobHash: BlobHash, ref: String)
+    suspend fun branchesFor(blobHash: BlobHash): List<String>
+
+    /** Every blob hash ever recorded as seen while indexing [ref] by name. */
+    suspend fun blobHashesOnBranch(ref: String): Set<BlobHash>
 }

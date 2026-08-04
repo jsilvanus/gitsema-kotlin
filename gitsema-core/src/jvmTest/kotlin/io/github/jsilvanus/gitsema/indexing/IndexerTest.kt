@@ -270,4 +270,92 @@ class IndexerTest {
         assertEquals(0, secondResult.blobsIndexed, "the blob content is unchanged -- no new embedding work")
         assertEquals(setOf("a.txt", "b.txt"), metadataStore.pathsFor(hash).map { it.value }.toSet())
     }
+
+    // Uniform short lines so FixedChunker's line-boundary-snapped chunk
+    // sizes stay close to the requested window size, making the fallback
+    // chain's behavior predictable to test against.
+    private fun uniformLineContent(lineCount: Int, lineLength: Int = 24): String =
+        (1..lineCount).joinToString("\n") { "x".repeat(lineLength) }
+
+    @Test
+    fun `a blob too large to embed whole falls back to 1500-char chunks and still gets indexed`() = runTest {
+        val bigContent = uniformLineContent(lineCount = 100) // ~2500 chars, well over any of the thresholds below
+        // Whole file (~2500 chars) exceeds this; each ~1500-char fallback
+        // chunk (~60 lines * 25) does not.
+        val provider = FakeEmbeddingProvider(maxTextLength = 1700)
+        val indexer = indexerForRepo(FakeGitRepository(mapOf("big.txt" to bigContent)), provider)
+
+        val result = indexer.index("HEAD")
+
+        assertEquals(1, result.blobsIndexed, "the blob should end up indexed via the fallback chain, not failed")
+        assertEquals(0, result.blobsFailed)
+        val hash = io.github.jsilvanus.gitsema.testutil.fakeBlobHash(bigContent)
+        assertTrue(vectorStore.isIndexed(hash, provider.modelId))
+        // FTS content is still stored once for the whole blob, regardless of
+        // how many vector chunks it took to embed it.
+        assertEquals(bigContent, ftsStore.get(hash))
+    }
+
+    @Test
+    fun `a blob too large even for 1500-char chunks falls back further to 800-char chunks`() = runTest {
+        val bigContent = uniformLineContent(lineCount = 100) // ~2500 chars
+        // Whole file and 1500-char chunks (~60 lines * 25 =~ 1499 chars) both
+        // exceed this; 800-char chunks (~32 lines * 25 =~ 799 chars) don't.
+        val provider = FakeEmbeddingProvider(maxTextLength = 1000)
+        val indexer = indexerForRepo(FakeGitRepository(mapOf("big.txt" to bigContent)), provider)
+
+        val result = indexer.index("HEAD")
+
+        assertEquals(1, result.blobsIndexed)
+        assertEquals(0, result.blobsFailed)
+        val hash = io.github.jsilvanus.gitsema.testutil.fakeBlobHash(bigContent)
+        assertTrue(vectorStore.isIndexed(hash, provider.modelId))
+    }
+
+    @Test
+    fun `a blob too large for every fallback size is counted failed, not silently dropped`() = runTest {
+        val bigContent = uniformLineContent(lineCount = 100)
+        // Even 800-char chunks (~799 chars) exceed this -- nothing succeeds.
+        val provider = FakeEmbeddingProvider(maxTextLength = 200)
+        val indexer = indexerForRepo(FakeGitRepository(mapOf("big.txt" to bigContent)), provider)
+
+        val result = indexer.index("HEAD")
+
+        assertEquals(0, result.blobsIndexed)
+        assertEquals(1, result.blobsFailed)
+        val hash = io.github.jsilvanus.gitsema.testutil.fakeBlobHash(bigContent)
+        assertTrue(!vectorStore.isIndexed(hash, provider.modelId))
+    }
+
+    @Test
+    fun `a partial success at 1500 is discarded, not kept alongside the 800 retry`() = runTest {
+        // This test only asserts the observable outcome (indexed via
+        // fallback, exactly one blob's worth of coverage) -- the "discard
+        // partial 1500 results" behavior itself is implementation-internal,
+        // but a regression that kept BOTH 1500 and 800 partial results would
+        // show up as extra, inconsistent vector_entry rows and is the kind
+        // of bug worth a dedicated end-to-end check rather than trusting the
+        // code path was exercised correctly by the tests above alone.
+        val bigContent = uniformLineContent(lineCount = 100)
+        val provider = FakeEmbeddingProvider(maxTextLength = 1000)
+        val indexer = indexerForRepo(FakeGitRepository(mapOf("big.txt" to bigContent)), provider)
+
+        indexer.index("HEAD")
+
+        val hash = io.github.jsilvanus.gitsema.testutil.fakeBlobHash(bigContent)
+        val queryVector = provider.embed(bigContent.lines().take(30).joinToString("\n"))
+        val hits = vectorStore.search(provider.modelId, queryVector, topK = 5)
+        assertEquals(1, hits.count { it.blobHash == hash }, "the blob must appear exactly once in results despite having multiple chunk records")
+    }
+
+    @Test
+    fun `every blob visited while indexing a ref is recorded as seen on that ref`() = runTest {
+        val files = mapOf("a.txt" to "alpha", "b.txt" to "beta")
+        val indexer = indexerFor(files).first
+
+        indexer.index("main")
+
+        assertEquals(setOf(io.github.jsilvanus.gitsema.testutil.fakeBlobHash("alpha"), io.github.jsilvanus.gitsema.testutil.fakeBlobHash("beta")), metadataStore.blobHashesOnBranch("main"))
+        assertTrue(metadataStore.blobHashesOnBranch("some-other-branch-never-indexed").isEmpty())
+    }
 }
