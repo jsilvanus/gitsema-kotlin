@@ -121,6 +121,17 @@ class SemanticIndexTest {
     }
 
     @Test
+    fun `status reports lastIndexedCommit only after index() has actually run`() = runTest {
+        val index = buildIndex(mapOf("a.txt" to "alpha"))
+
+        assertEquals(null, index.status().lastIndexedCommit)
+
+        index.index("HEAD")
+
+        assertEquals("fakehead".padEnd(40, '0'), index.status().lastIndexedCommit?.value)
+    }
+
+    @Test
     fun `indexing twice then searching still finds results (idempotent index feeding a working search)`() = runTest {
         val index = buildIndex(mapOf("a.txt" to "unique searchable content about widgets"))
         index.index("HEAD")

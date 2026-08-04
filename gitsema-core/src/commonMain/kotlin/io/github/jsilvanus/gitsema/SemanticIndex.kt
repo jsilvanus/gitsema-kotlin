@@ -4,7 +4,6 @@ import io.github.jsilvanus.gitsema.chunking.Chunker
 import io.github.jsilvanus.gitsema.embedding.EmbeddingProvider
 import io.github.jsilvanus.gitsema.git.GitRepository
 import io.github.jsilvanus.gitsema.indexing.Indexer
-import io.github.jsilvanus.gitsema.model.CommitHash
 import io.github.jsilvanus.gitsema.model.IndexProgress
 import io.github.jsilvanus.gitsema.model.IndexResult
 import io.github.jsilvanus.gitsema.model.IndexStatus
@@ -60,8 +59,18 @@ class GitsemaSemanticIndex(
     )
     private val searchEngine = SearchEngine(metadataStore, vectorStore, ftsStore, provider)
 
-    override suspend fun index(ref: String, onProgress: (IndexProgress) -> Unit): IndexResult =
-        indexer.index(ref, since = null, onProgress = onProgress)
+    // status() (porting brief's interface) takes no ref, but the resume
+    // cursor is keyed by one (kotlin-port.md §7.2) -- remembering the most
+    // recently indexed ref in-process is the simplest honest way to answer
+    // "what did status() index," without inventing a param the brief's
+    // sketch doesn't have. Null until index() has been called at least once.
+    private var lastIndexedRef: String? = null
+
+    override suspend fun index(ref: String, onProgress: (IndexProgress) -> Unit): IndexResult {
+        val result = indexer.index(ref, since = null, onProgress = onProgress)
+        lastIndexedRef = ref
+        return result
+    }
 
     override suspend fun search(query: Query): List<Match> = searchEngine.search(query)
 
@@ -70,11 +79,7 @@ class GitsemaSemanticIndex(
         return IndexStatus(
             blobCount = metadataStore.blobCount(),
             embeddedBlobCount = vectorStore.countForModel(provider.modelId),
-            // Not tracked yet -- depends on the not-yet-built commit-mapping
-            // pass (kotlin-port.md's Indexer scope note), same gap as
-            // MetadataStore.firstSeenFor. Left explicitly null rather than a
-            // guessed/stale value.
-            lastIndexedCommit = null as CommitHash?,
+            lastIndexedCommit = lastIndexedRef?.let { metadataStore.getResumeCursor(it) },
             embeddingModel = embedConfig?.model,
             embeddingDimensions = embedConfig?.dimensions,
         )
