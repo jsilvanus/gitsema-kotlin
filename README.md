@@ -4,11 +4,11 @@ A Kotlin Multiplatform (JVM + Android) port of [gitsema](https://github.com/jsil
 indexing and search core, built as a standalone library for
 [Aidos](https://github.com/jsilvanus/aidos).
 
-**Status: Tier 1 core loop complete and operational on the JVM target** — index →
-search through the public API, with commit-mapping, recency ranking, and an
-ancestry-aware resume cursor all real (not stubbed). Not yet publishable to a
-real audience (still 0.1.0-SNAPSHOT), and `androidTarget()` isn't wired yet —
-see below.
+**Status: Tier 1 complete and operational on the JVM target** — index → search
+through the public API, with commit-mapping, recency ranking, an
+ancestry-aware resume cursor, branch filtering, and the context-limit
+fallback chain all real (not stubbed). Not yet publishable to a real audience
+(still 0.1.0-SNAPSHOT), and `androidTarget()` isn't wired yet — see below.
 
 The full specification — algorithms, constants with their rationale, cost
 profiles, and the decisions behind every departure from gitsema-TS — lives in
@@ -25,9 +25,12 @@ only orients you to what's actually built.
 - **Models** (`BlobHash`, `Chunk`, `Match`, `Query`, `IndexProgress/Result/Status`)
   and the `EmbeddingProvider` seam (kotlin-port.md §3.1, §8) — `commonMain`.
 - **Chunking**: `FileChunker` (default, whole-file, §2.1) and `FixedChunker`
-  (character-window splitting with line-boundary snapping, §2.2). Not yet
-  wired: the context-limit fallback chain (§2.4) and the function chunker —
-  see "What's deliberately not here yet."
+  (character-window splitting with line-boundary snapping, §2.2), wired
+  together via the **context-limit fallback chain** (§2.4): whole-file → fixed
+  1500 → fixed 800 → fail, storing one chunk-indexed vector per surviving
+  sub-chunk only when every sub-chunk at a given window size embeds
+  successfully. The function-chunker tier is still skipped (needs tree-sitter,
+  out of scope per the design doc's Decision A without asking first).
 - **Git access**: `GitRepository` interface (porting brief seam #3) with a
   JGit-backed implementation in `jvmAndroidMain` (§7.3).
   - `streamBlobs` uses `ObjectWalk` specifically to match `git rev-list
@@ -41,9 +44,16 @@ only orients you to what's actually built.
   - `VectorStore` is the §9 redesign: int8-quantized vectors in a flat,
     memory-mapped file (one per model), a tiny SQLite table mapping
     `blob_hash → file_offset`, and streamed top-K search via a bounded
-    min-heap — memory use is O(topK), never O(stored vector count).
+    min-heap — memory use is O(topK), never O(stored vector count). Supports
+    chunk-indexed records for the fallback chain (a blob can have several,
+    deduplicated back to one hit — its best-scoring chunk — at search time,
+    without breaking the O(topK) memory bound).
   - `FtsStore` is SQLite FTS5 (Porter/ASCII), with query sanitization before
     every `MATCH` (§4.3).
+  - A `blob_branch_entry` table backs `Query.branch` filtering: a row means
+    "this blob was visited while indexing this ref by name" (reusing
+    `ObjectWalk`, not full git branch-topology computation) — see
+    `BlobBranches.sq` for the precise semantic.
 - **Embedding orchestration**: `EmbeddingOrchestrator` — batched,
   concurrency-limited (default 4, matching gitsema-TS's `p-limit` default),
   with per-item failure containment so one bad item never sinks its batch (§7.4).
@@ -67,15 +77,18 @@ only orients you to what's actually built.
   yet used — see `.github/workflows/publish.yml` (manual `workflow_dispatch`
   only, not on every push).
 
-**86 tests passing** (`jvm` target), covering: chunking determinism (both
+**96 tests passing** (`jvm` target), covering: chunking determinism (both
 strategies) and coverage/overlap invariants, quantization accuracy/determinism,
 storage idempotency and multi-path blobs, FTS sanitization, vector store
 correctness/dedup/topK-boundedness plus a memory-ceiling smoke test, embedding
 batching and per-item failure isolation, real multi-commit history against
 JGit (ordering, root-commit diffing, since-filtering, modified vs. added),
 indexer dedup/resumability/the resume-cursor's full lifecycle, ranking and
-hybrid-blend edge cases, and end-to-end `SemanticIndex` tests including the
-degraded-search deliverable and `status()`'s coverage reporting.
+hybrid-blend edge cases, end-to-end `SemanticIndex` tests including the
+degraded-search deliverable and `status()`'s coverage reporting, the
+context-limit fallback chain (all-or-nothing per window size, chunk-indexed
+storage, and the function-chunker tier staying skipped), and branch filtering
+across both the hybrid and degraded FTS-only search paths.
 
 ## What's deliberately not here yet
 
@@ -86,16 +99,10 @@ degraded-search deliverable and `status()`'s coverage reporting.
   a direct request, not assumed), so it could not be added and verified
   honestly. Wiring it is a mechanical follow-up once run somewhere with both
   available — no `commonMain` or `jvmAndroidMain` code needs to change.
-- **The context-limit fallback chain and function chunker** (§2.4). The
-  function chunker specifically needs tree-sitter, which Decision A in the
-  design doc says not to build on-device without asking first. `FixedChunker`
-  exists and is tested, but wiring the fallback chain into the indexer needs
-  chunk-level vector storage (a fallback chunk's embedding stored distinctly
-  from its blob's whole-file one), which `VectorStore` doesn't support yet —
-  a real architecture decision (extend `VectorStore`'s key model vs. a
-  parallel chunk store), deferred rather than rushed or faked.
-- **Branch filtering** (`Query.branch`) — needs a `blob_branches`-equivalent
-  table and JGit branch-membership computation on top of commit-mapping.
+- **The function chunker** (§2.4's remaining tier). It needs tree-sitter,
+  which Decision A in the design doc says not to build on-device without
+  asking first. The rest of the fallback chain (whole-file → fixed 1500 →
+  fixed 800 → fail, with chunk-indexed vector storage) is wired and tested.
 - **Fully-streaming blob/commit ingestion** — the indexer still drains each
   git walk into a list before batching (lightweight metadata only, not blob
   content; documented as a known gap, not silent).
