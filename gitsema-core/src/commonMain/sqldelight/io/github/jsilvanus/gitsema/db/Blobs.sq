@@ -1,0 +1,40 @@
+-- Content-addressed blob registry (kotlin-port.md §1.1). blob_hash is Git's
+-- own SHA-1; every other table keys off it, never off path or commit.
+CREATE TABLE blob_entry (
+    blob_hash TEXT NOT NULL PRIMARY KEY,
+    size INTEGER NOT NULL,
+    indexed_at INTEGER NOT NULL
+);
+
+-- One blob can map to many paths (kotlin-port.md §7.3's empirical finding:
+-- a single walk only ever surfaces one path per blob, so this table fills in
+-- over the index's lifetime, across repeated walks). UNIQUE prevents
+-- duplicate rows on repeat insert -- the same discipline as gitsema-TS's
+-- schema v20 fix.
+CREATE TABLE path_entry (
+    blob_hash TEXT NOT NULL,
+    path TEXT NOT NULL,
+    UNIQUE (blob_hash, path)
+);
+
+CREATE INDEX path_entry_blob_hash_idx ON path_entry (blob_hash);
+
+insertBlob:
+INSERT OR IGNORE INTO blob_entry(blob_hash, size, indexed_at)
+VALUES (?, ?, ?);
+
+insertPath:
+INSERT OR IGNORE INTO path_entry(blob_hash, path)
+VALUES (?, ?);
+
+pathsForBlob:
+SELECT path FROM path_entry WHERE blob_hash = ?;
+
+pathsForBlobs:
+SELECT blob_hash, path FROM path_entry WHERE blob_hash IN ?;
+
+blobExists:
+SELECT EXISTS(SELECT 1 FROM blob_entry WHERE blob_hash = ?);
+
+blobCount:
+SELECT COUNT(*) FROM blob_entry;

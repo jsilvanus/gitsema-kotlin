@@ -1,0 +1,29 @@
+-- The ancestry-aware resume cursor (kotlin-port.md §7.2, Decision C #3):
+-- one row per ref, holding the tip commit hash as of the last FULLY
+-- completed index run for that ref. Deliberately NOT derived from
+-- indexed_commit_entry's insertion order (gitsema-TS's bug -- the row with
+-- the latest indexed_at can be the OLDEST commit walked, because
+-- commit-message embedding is fanned out asynchronously after the stream
+-- drains, so insertion order doesn't track walk order). This table is only
+-- ever written once, atomically, after a run's entire commit stream has been
+-- processed successfully -- an interrupted run leaves it untouched, so the
+-- next run conservatively re-walks from the last known-good point rather
+-- than risking a gap.
+-- updated_at backs mostRecentRef: which ref a caller most recently finished
+-- indexing, derived from durable storage rather than an in-process variable
+-- (PR #1 review finding: a process-local "last indexed ref" under-reports
+-- after Android process death, which is routine there, not exceptional).
+CREATE TABLE resume_cursor (
+    ref TEXT NOT NULL PRIMARY KEY,
+    commit_hash TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+setResumeCursor:
+INSERT OR REPLACE INTO resume_cursor(ref, commit_hash, updated_at) VALUES (?, ?, ?);
+
+getResumeCursor:
+SELECT commit_hash FROM resume_cursor WHERE ref = ?;
+
+mostRecentRef:
+SELECT ref FROM resume_cursor ORDER BY updated_at DESC LIMIT 1;

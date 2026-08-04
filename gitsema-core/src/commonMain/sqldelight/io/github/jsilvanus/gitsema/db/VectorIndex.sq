@@ -1,0 +1,55 @@
+-- The SQLite half of kotlin-port.md §9.2's vector store: maps a (blob_hash,
+-- model, chunk_index) to its record's byte offset in the model's flat,
+-- memory-mapped vector file. The vector bytes themselves -- quant_min/
+-- quant_scale/int8 data -- live ONLY in that flat file, never here (that's
+-- the whole point of the redesign: never hydrate a vector through the SQL
+-- engine). This table is deliberately tiny per row so the *index* stays
+-- cheap to scan even though the *vectors* don't live in SQLite anymore.
+--
+-- chunk_index = -1 means "the whole-file vector" (the Tier 1 default path,
+-- FileChunker). A non-negative chunk_index is a context-limit fallback
+-- sub-chunk (kotlin-port.md §2.4): a blob that couldn't be embedded whole
+-- gets one row per successfully-embedded FixedChunker window instead. A
+-- blob can have EITHER one whole-file row OR several chunk rows, never
+-- both -- the indexer's fallback chain only produces chunk rows when the
+-- whole-file attempt failed on context length.
+CREATE TABLE vector_entry (
+    blob_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL DEFAULT -1,
+    file_offset INTEGER NOT NULL,
+    PRIMARY KEY (blob_hash, model, chunk_index)
+);
+
+CREATE INDEX vector_entry_model_offset_idx ON vector_entry (model, file_offset);
+
+insertVectorEntry:
+INSERT OR IGNORE INTO vector_entry(blob_hash, model, chunk_index, file_offset)
+VALUES (?, ?, ?, ?);
+
+-- "Indexed" means at least one vector row exists for this blob under this
+-- model -- whole-file OR chunk-fallback, doesn't matter which: either way
+-- the indexer shouldn't re-embed it.
+isVectorIndexed:
+SELECT EXISTS(SELECT 1 FROM vector_entry WHERE blob_hash = ? AND model = ?);
+
+-- Streaming order matters (kotlin-port.md §9.2): ordering by file_offset
+-- means a sequential scan of this result set walks the flat file
+-- sequentially too, which is exactly the access pattern that makes a
+-- memory-mapped file's OS page cache behave well instead of thrashing.
+allVectorEntriesForModel:
+SELECT blob_hash, chunk_index, file_offset FROM vector_entry WHERE model = ? ORDER BY file_offset;
+
+vectorEntryFor:
+SELECT file_offset FROM vector_entry WHERE blob_hash = ? AND model = ? AND chunk_index = ?;
+
+-- Distinct blobs, not row count -- a blob with several chunk-fallback rows
+-- must still count once, matching what "how many blobs are embedded" means
+-- to a caller (kotlin-port.md's IndexStatus.embeddedBlobCount).
+countForModel:
+SELECT COUNT(DISTINCT blob_hash) FROM vector_entry WHERE model = ?;
+
+-- Filters an already-known candidate set to just the ones actually indexed
+-- for [model] -- lets the indexer skip re-embedding without a per-hash query.
+filterNewBlobs:
+SELECT DISTINCT blob_hash FROM vector_entry WHERE model = ? AND blob_hash IN ?;

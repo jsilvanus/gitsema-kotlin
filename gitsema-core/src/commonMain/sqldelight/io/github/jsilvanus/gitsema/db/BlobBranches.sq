@@ -1,0 +1,28 @@
+-- Branch membership for search filtering (Query.branch, kotlin-port.md §4).
+--
+-- Semantic, stated precisely because it's a real simplification, not full
+-- git branch-topology awareness: a row exists for (blob, ref) whenever that
+-- blob was actually visited while `Indexer.index(ref, ...)` walked that
+-- specific ref -- i.e. "this blob was seen while indexing under this ref
+-- name," not "this blob is reachable from this branch's tip right now."
+-- Calling index() once for "HEAD" and never for "main"/"feature/x" by name
+-- means no branch-specific rows accumulate at all. This is honest and
+-- correct for what it claims, and reuses ObjectWalk (kotlin-port.md §7.3)
+-- rather than inventing a separate ancestry-based approximation -- but it is
+-- not a substitute for indexing every branch you want filterable by name.
+CREATE TABLE blob_branch_entry (
+    blob_hash TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    PRIMARY KEY (blob_hash, branch)
+);
+
+CREATE INDEX blob_branch_entry_branch_idx ON blob_branch_entry (branch);
+
+addBlobBranch:
+INSERT OR IGNORE INTO blob_branch_entry(blob_hash, branch) VALUES (?, ?);
+
+branchesFor:
+SELECT branch FROM blob_branch_entry WHERE blob_hash = ?;
+
+blobHashesOnBranch:
+SELECT blob_hash FROM blob_branch_entry WHERE branch = ?;
