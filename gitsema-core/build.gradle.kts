@@ -4,10 +4,15 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.sqldelight)
+    `maven-publish`
 }
 
 group = "io.github.jsilvanus"
-version = "0.1.0-SNAPSHOT"
+// `-Pversion=X` (used by the manual publish workflow) must be able to
+// override this -- a bare `version = "0.1.0-SNAPSHOT"` assignment would
+// silently clobber a command-line-supplied value, since script evaluation
+// runs after Gradle sets project properties from -P flags.
+version = (findProperty("version") as String?)?.takeUnless { it == "unspecified" } ?: "0.1.0-SNAPSHOT"
 
 // ---------------------------------------------------------------------------
 // Android target: NOT wired in this build file yet.
@@ -92,6 +97,52 @@ sqldelight {
     databases {
         create("GitsemaDatabase") {
             packageName.set("io.github.jsilvanus.gitsema.db")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Publishing: GitHub Packages, manual-dispatch only (.github/workflows/publish.yml)
+// — not on every push. Not expected to be used routinely while Tier 1/2 are
+// still in flux; wired now per explicit request so it exists and is correct
+// once there's something worth publishing, rather than being invented later
+// under time pressure. KMP + maven-publish auto-creates one publication per
+// target (currently just "jvm"; androidRelease joins automatically once that
+// target is wired, no changes needed here).
+// ---------------------------------------------------------------------------
+publishing {
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/jsilvanus/gitsema-kotlin")
+            credentials {
+                username = System.getenv("GITHUB_ACTOR")
+                password = System.getenv("GITHUB_TOKEN")
+            }
+        }
+    }
+    publications.withType<MavenPublication>().configureEach {
+        pom {
+            name.set("gitsema-kotlin")
+            description.set("Kotlin Multiplatform port of gitsema's indexing and search core.")
+            url.set("https://github.com/jsilvanus/gitsema-kotlin")
+            licenses {
+                license {
+                    name.set("ISC License")
+                    url.set("https://github.com/jsilvanus/gitsema-kotlin/blob/main/LICENSE")
+                }
+            }
+            developers {
+                developer {
+                    id.set("jsilvanus")
+                    name.set("Juha Itäleino")
+                    email.set("jsilvanus@gmail.com")
+                }
+            }
+            scm {
+                url.set("https://github.com/jsilvanus/gitsema-kotlin")
+                connection.set("scm:git:https://github.com/jsilvanus/gitsema-kotlin.git")
+            }
         }
     }
 }
