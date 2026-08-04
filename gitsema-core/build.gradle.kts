@@ -3,6 +3,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
+    alias(libs.plugins.sqldelight)
 }
 
 group = "io.github.jsilvanus"
@@ -42,6 +43,8 @@ kotlin {
         val commonMain by getting {
             dependencies {
                 implementation(libs.kotlinx.coroutines.core)
+                implementation(libs.sqldelight.runtime)
+                implementation(libs.sqldelight.coroutines)
             }
         }
         val commonTest by getting {
@@ -65,11 +68,29 @@ kotlin {
 
         val jvmMain by getting {
             dependsOn(jvmAndroidMain)
+            dependencies {
+                implementation(libs.sqldelight.jvm.driver)
+            }
         }
         val jvmTest by getting {
             dependencies {
                 implementation(kotlin("test-junit"))
             }
+        }
+    }
+}
+
+// SQLDelight generates its typed Database/Queries API from the .sq files
+// under src/commonMain/sqldelight/ into commonMain-visible code — the
+// generated API is itself pure Kotlin (no java.* usage), so the actual
+// MetadataStore/FtsStore implementations can live in commonMain too. Only
+// constructing the underlying SqlDriver is platform-specific (kotlin-port.md
+// §6.4's storage seam) — see SqlDriverFactory.kt (expect in jvmAndroidMain,
+// actual in jvmMain, and eventually androidMain).
+sqldelight {
+    databases {
+        create("GitsemaDatabase") {
+            packageName.set("io.github.jsilvanus.gitsema.db")
         }
     }
 }

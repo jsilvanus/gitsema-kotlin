@@ -1,0 +1,54 @@
+-- "commit" is a SQL keyword (transaction control) -- table named commit_entry
+-- to avoid any ambiguity, same reasoning applied to "blob_entry" for BLOB.
+CREATE TABLE commit_entry (
+    commit_hash TEXT NOT NULL PRIMARY KEY,
+    timestamp INTEGER NOT NULL,
+    author_name TEXT NOT NULL,
+    author_email TEXT NOT NULL,
+    message TEXT NOT NULL
+);
+
+-- Many-to-many blob <-> commit join (kotlin-port.md §1.1).
+CREATE TABLE blob_commit_entry (
+    blob_hash TEXT NOT NULL,
+    commit_hash TEXT NOT NULL,
+    PRIMARY KEY (blob_hash, commit_hash)
+);
+
+CREATE INDEX blob_commit_entry_commit_idx ON blob_commit_entry (commit_hash);
+
+-- Resume-cursor tracking (kotlin-port.md §7.2, §Decision C #3). Deliberately
+-- NOT modeled as "most recently inserted row" the way gitsema-TS's
+-- indexed_commits table works -- see IndexedCommitStore for the ancestry-aware
+-- replacement.
+CREATE TABLE indexed_commit_entry (
+    commit_hash TEXT NOT NULL PRIMARY KEY,
+    indexed_at INTEGER NOT NULL
+);
+
+insertCommit:
+INSERT OR IGNORE INTO commit_entry(commit_hash, timestamp, author_name, author_email, message)
+VALUES (?, ?, ?, ?, ?);
+
+linkBlobCommit:
+INSERT OR IGNORE INTO blob_commit_entry(blob_hash, commit_hash)
+VALUES (?, ?);
+
+markCommitIndexed:
+INSERT OR IGNORE INTO indexed_commit_entry(commit_hash, indexed_at)
+VALUES (?, ?);
+
+isCommitIndexed:
+SELECT EXISTS(SELECT 1 FROM indexed_commit_entry WHERE commit_hash = ?);
+
+lastIndexedCommitByInsertOrder:
+SELECT commit_hash FROM indexed_commit_entry ORDER BY indexed_at DESC LIMIT 1;
+
+firstSeenForBlob:
+SELECT MIN(c.timestamp) AS first_seen
+FROM blob_commit_entry bc
+JOIN commit_entry c ON bc.commit_hash = c.commit_hash
+WHERE bc.blob_hash = ?;
+
+commitCount:
+SELECT COUNT(*) FROM commit_entry;

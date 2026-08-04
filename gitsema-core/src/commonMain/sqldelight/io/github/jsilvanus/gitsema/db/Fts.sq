@@ -1,0 +1,29 @@
+-- FTS5 keyword index (kotlin-port.md §4.3, constraint 6: "FTS first" -- this
+-- works before any embedding model exists and is nearly free with SQLite).
+-- Porter-stemmed, ASCII-tokenized, matching gitsema-TS's blob_fts exactly.
+-- Explicit "TEXT" type names on FTS5 columns are ignored at runtime (FTS5
+-- stores everything as text regardless) but let SQLDelight's type inference
+-- resolve them instead of failing on an untyped virtual-table column.
+CREATE VIRTUAL TABLE blob_fts USING fts5(
+    blob_hash TEXT UNINDEXED,
+    content TEXT,
+    tokenize = 'porter ascii'
+);
+
+insertFtsContent:
+INSERT INTO blob_fts(blob_hash, content) VALUES (?, ?);
+
+deleteFtsContent:
+DELETE FROM blob_fts WHERE blob_hash = ?;
+
+ftsContentFor:
+SELECT content FROM blob_fts WHERE blob_hash = ?;
+
+-- Lower bm25() score is a better match (kotlin-port.md §4.3) -- callers
+-- negate it before blending with cosine similarity, where higher is better.
+searchFts:
+SELECT blob_hash, bm25(blob_fts) AS score
+FROM blob_fts
+WHERE blob_fts MATCH :query
+ORDER BY score
+LIMIT :limit;
