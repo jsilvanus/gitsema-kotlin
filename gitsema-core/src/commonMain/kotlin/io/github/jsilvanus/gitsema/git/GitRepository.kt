@@ -9,6 +9,24 @@ import kotlinx.coroutines.flow.Flow
 data class BlobPathEntry(val path: RepoPath, val blobHash: BlobHash)
 
 /**
+ * One commit, with the blobs it added or modified relative to its first
+ * parent (root commits diff against an empty tree — everything is "added").
+ * Deletions and content-unchanged renames are excluded, matching
+ * gitsema-TS's `commitMap.ts` (kotlin-port.md §7.3) — a pure rename still
+ * surfaces here as an ADD-type entry for its new path (same blob hash,
+ * because renames aren't detected specially), which is exactly how an
+ * existing blob accumulates a new path over the index's lifetime.
+ */
+data class CommitInfo(
+    val hash: CommitHash,
+    val timestampEpochSeconds: Long,
+    val authorName: String,
+    val authorEmail: String,
+    val message: String,
+    val changedBlobs: List<BlobPathEntry>,
+)
+
+/**
  * Seam #3 from the porting brief: repository access lives behind this
  * interface so the library is testable without a real repository on disk, and
  * so the concrete implementation can be JGit on JVM/Android without that
@@ -42,4 +60,16 @@ interface GitRepository {
      * an oversized blob in memory even transiently.
      */
     suspend fun readBlob(hash: BlobHash, maxBytes: Long): ByteArray?
+
+    /**
+     * Stream commits reachable from [ref], newest first (mirrors `commitMap.ts`'s
+     * `streamCommitMap()`, kotlin-port.md §7.3), each with its added/modified
+     * blobs. If [since] is given, only commits not already reachable from
+     * [since] are walked. **The first commit emitted, when [since] is null,
+     * is [ref]'s current tip** — callers that want an ancestry-aware resume
+     * cursor (kotlin-port.md Decision C #3, not gitsema-TS's insertion-order
+     * cursor) should capture that first hash and persist it only after the
+     * whole stream has been consumed successfully.
+     */
+    fun streamCommits(ref: String, since: CommitHash? = null): Flow<CommitInfo>
 }

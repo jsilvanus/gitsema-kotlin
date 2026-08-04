@@ -132,4 +132,73 @@ class JGitRepositoryTest {
 
         assertNull(bytes)
     }
+
+    @Test
+    fun `streamCommits emits newest first with the root commit diffed against an empty tree`() = runTest {
+        writeAndCommit("a.txt", "first", "commit 1")
+        writeAndCommit("b.txt", "second", "commit 2")
+        repo = JGitRepository(tempDir)
+
+        val commits = repo.streamCommits("HEAD").toList()
+
+        assertEquals(2, commits.size)
+        assertEquals("commit 2", commits[0].message, "newest first")
+        assertEquals("commit 1", commits[1].message)
+        // Root commit (commit 1) has no parent -- everything in it is "added"
+        // relative to an empty tree.
+        assertTrue(commits[1].changedBlobs.any { it.path.value == "a.txt" })
+        assertTrue(commits[0].changedBlobs.any { it.path.value == "b.txt" })
+        assertTrue(commits[0].changedBlobs.none { it.path.value == "a.txt" }, "commit 2 didn't touch a.txt, so it shouldn't appear as changed")
+    }
+
+    @Test
+    fun `streamCommits reports author, timestamp, and message`() = runTest {
+        writeAndCommit("a.txt", "content", "a descriptive message")
+        repo = JGitRepository(tempDir)
+
+        val commit = repo.streamCommits("HEAD").toList().single()
+
+        assertEquals("a descriptive message", commit.message)
+        assertEquals("Test", commit.authorName)
+        assertEquals("test@example.com", commit.authorEmail)
+        assertTrue(commit.timestampEpochSeconds > 0)
+    }
+
+    @Test
+    fun `streamCommits with since excludes already-reachable commits`() = runTest {
+        writeAndCommit("a.txt", "first", "commit 1")
+        val firstHead = git.repository.resolve("HEAD")!!.name
+        writeAndCommit("b.txt", "second", "commit 2")
+        writeAndCommit("c.txt", "third", "commit 3")
+        repo = JGitRepository(tempDir)
+
+        val commits = repo.streamCommits("HEAD", since = io.github.jsilvanus.gitsema.model.CommitHash(firstHead)).toList()
+
+        assertEquals(2, commits.size)
+        assertTrue(commits.none { it.message == "commit 1" })
+    }
+
+    @Test
+    fun `a modified file (not just added) is reported as a changed blob with its new hash`() = runTest {
+        writeAndCommit("a.txt", "version one", "commit 1")
+        writeAndCommit("a.txt", "version two", "commit 2")
+        repo = JGitRepository(tempDir)
+
+        val latest = repo.streamCommits("HEAD").toList().first()
+
+        assertEquals(1, latest.changedBlobs.size)
+        assertEquals("a.txt", latest.changedBlobs.single().path.value)
+    }
+
+    @Test
+    fun `a commit that touches nothing new, such as an empty commit, reports no changed blobs`() = runTest {
+        writeAndCommit("a.txt", "content", "commit 1")
+        git.commit().setAllowEmpty(true).setMessage("empty commit").setAuthor("Test", "test@example.com").call()
+        repo = JGitRepository(tempDir)
+
+        val latest = repo.streamCommits("HEAD").toList().first()
+
+        assertEquals("empty commit", latest.message)
+        assertTrue(latest.changedBlobs.isEmpty())
+    }
 }

@@ -8,14 +8,19 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import org.eclipse.jgit.diff.DiffEntry
+import org.eclipse.jgit.diff.DiffFormatter
 import org.eclipse.jgit.errors.MissingObjectException
 import org.eclipse.jgit.lib.Constants
 import org.eclipse.jgit.lib.ObjectId
 import org.eclipse.jgit.lib.ObjectLoader
 import org.eclipse.jgit.lib.Repository
 import org.eclipse.jgit.revwalk.ObjectWalk
-import org.eclipse.jgit.revwalk.RevCommit
+import org.eclipse.jgit.revwalk.RevWalk
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder
+import org.eclipse.jgit.treewalk.CanonicalTreeParser
+import org.eclipse.jgit.treewalk.EmptyTreeIterator
+import org.eclipse.jgit.util.io.DisabledOutputStream
 import java.io.File
 
 /**
@@ -85,10 +90,59 @@ class JGitRepository(repoDir: File) : GitRepository, AutoCloseable {
         loader.cachedBytes
     }
 
+    override fun streamCommits(ref: String, since: CommitHash?): Flow<CommitInfo> = flow {
+        val startId = repository.resolve(ref) ?: return@flow
+        RevWalk(repository).use { walk ->
+            val start = walk.parseCommit(startId)
+            walk.markStart(start)
+            if (since != null) {
+                val sinceId = repository.resolve(since.value)
+                if (sinceId != null) {
+                    walk.markUninteresting(walk.parseCommit(sinceId))
+                }
+            }
+
+            val reader = repository.newObjectReader()
+            for (commit in walk) {
+                val newTree = CanonicalTreeParser().apply { reset(reader, commit.tree) }
+                val oldTree = if (commit.parentCount > 0) {
+                    val parent = walk.parseCommit(commit.getParent(0))
+                    CanonicalTreeParser().apply { reset(reader, parent.tree) }
+                } else {
+                    EmptyTreeIterator()
+                }
+
+                val diffs: List<DiffEntry> = DiffFormatter(DisabledOutputStream.INSTANCE).use { formatter ->
+                    formatter.setRepository(repository)
+                    // No rename detection: a plain content-identical rename
+                    // then surfaces as a DELETE (ignored, see the filter
+                    // below) + an ADD at the new path for the SAME blob hash
+                    // -- exactly how an already-known blob is meant to pick
+                    // up a new path over the index's lifetime (kotlin-port.md
+                    // §1.1), not something to special-case away.
+                    formatter.scan(oldTree, newTree)
+                }
+
+                val changedBlobs = diffs
+                    .filter { it.changeType == DiffEntry.ChangeType.ADD || it.changeType == DiffEntry.ChangeType.MODIFY || it.changeType == DiffEntry.ChangeType.COPY }
+                    .map { entry -> BlobPathEntry(RepoPath(entry.newPath), BlobHash(entry.newId.toObjectId().name)) }
+
+                val authorIdent = commit.authorIdent
+                emit(
+                    CommitInfo(
+                        hash = CommitHash(commit.name),
+                        timestampEpochSeconds = commit.commitTime.toLong(),
+                        authorName = authorIdent?.name ?: "",
+                        authorEmail = authorIdent?.emailAddress ?: "",
+                        message = commit.shortMessage,
+                        changedBlobs = changedBlobs,
+                    ),
+                )
+            }
+        }
+    }.flowOn(Dispatchers.IO)
+
     override fun close() {
         repository.close()
     }
 }
-
-/** A single named commit reachable during a walk — not yet used by [JGitRepository]; kept for the commit-mapping pass (kotlin-port.md §7.1 Phase C). */
-internal fun RevCommit.epochSeconds(): Long = commitTime.toLong()

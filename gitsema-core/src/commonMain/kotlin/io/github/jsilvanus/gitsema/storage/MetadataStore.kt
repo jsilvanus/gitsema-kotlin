@@ -45,4 +45,17 @@ interface MetadataStore {
 
     suspend fun upsertEmbedConfig(config: EmbedConfigMeta)
     suspend fun embedConfigFor(model: String): EmbedConfigMeta?
+
+    /**
+     * The ancestry-aware resume cursor (kotlin-port.md §7.2, Decision C #3):
+     * [ref]'s tip commit as of the last FULLY completed index run — never
+     * derived from write-insertion order, unlike gitsema-TS's
+     * `getLastIndexedCommit()`. Callers should only call [setResumeCursor]
+     * after an entire [io.github.jsilvanus.gitsema.git.GitRepository.streamCommits]
+     * pass has been consumed successfully, not incrementally mid-run — an
+     * interrupted run should leave the previous cursor untouched so the next
+     * run conservatively re-walks from the last known-good point.
+     */
+    suspend fun setResumeCursor(ref: String, commitHash: CommitHash)
+    suspend fun getResumeCursor(ref: String): CommitHash?
 }

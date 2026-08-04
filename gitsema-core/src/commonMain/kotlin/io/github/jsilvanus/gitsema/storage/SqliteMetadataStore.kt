@@ -18,6 +18,7 @@ class SqliteMetadataStore(private val database: GitsemaDatabase) : MetadataStore
     private val blobs = database.blobsQueries
     private val commits = database.commitsQueries
     private val embedConfig = database.embedConfigQueries
+    private val resumeCursor = database.resumeCursorQueries
 
     override suspend fun putBlob(blobHash: BlobHash, size: Long, indexedAtEpochSeconds: Long) =
         withContext(Dispatchers.IO) {
@@ -87,5 +88,13 @@ class SqliteMetadataStore(private val database: GitsemaDatabase) : MetadataStore
                 lastUsedAtEpochSeconds = it.last_used_at,
             )
         }
+    }
+
+    override suspend fun setResumeCursor(ref: String, commitHash: CommitHash) = withContext(Dispatchers.IO) {
+        resumeCursor.setResumeCursor(ref, commitHash.value)
+    }
+
+    override suspend fun getResumeCursor(ref: String): CommitHash? = withContext(Dispatchers.IO) {
+        resumeCursor.getResumeCursor(ref).executeAsOneOrNull()?.let { CommitHash(it) }
     }
 }

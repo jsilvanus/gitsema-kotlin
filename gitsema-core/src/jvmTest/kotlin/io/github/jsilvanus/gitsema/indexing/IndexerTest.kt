@@ -52,6 +52,16 @@ class IndexerTest {
         return indexer to provider
     }
 
+    private fun indexerForRepo(repository: FakeGitRepository, provider: FakeEmbeddingProvider = FakeEmbeddingProvider()): Indexer =
+        Indexer(
+            repository = repository,
+            provider = provider,
+            metadataStore = metadataStore,
+            vectorStore = vectorStore,
+            ftsStore = ftsStore,
+            chunker = FileChunker(),
+        )
+
     @Test
     fun `indexes every distinct blob and reports accurate stats`() = runTest {
         val (indexer, _) = indexerFor(mapOf("a.txt" to "alpha content", "b.txt" to "beta content", "c.txt" to "gamma content"))
@@ -178,5 +188,86 @@ class IndexerTest {
 
         assertTrue(progressReports.isNotEmpty())
         assertEquals(5, progressReports.last().blobsIndexed)
+    }
+
+    @Test
+    fun `commit-mapping populates firstSeenFor, activating recency for real`() = runTest {
+        val commits = listOf(
+            io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c2".padEnd(40, '0'), timestampEpochSeconds = 200, files = mapOf("b.txt" to "beta")),
+            io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c1".padEnd(40, '0'), timestampEpochSeconds = 100, files = mapOf("a.txt" to "alpha")),
+        )
+        val files = mapOf("a.txt" to "alpha", "b.txt" to "beta")
+        val indexer = indexerForRepo(FakeGitRepository(files, commits))
+
+        val result = indexer.index("HEAD")
+
+        assertEquals(2, result.commitsProcessed)
+        assertEquals(100L, metadataStore.firstSeenFor(io.github.jsilvanus.gitsema.testutil.fakeBlobHash("alpha")))
+        assertEquals(200L, metadataStore.firstSeenFor(io.github.jsilvanus.gitsema.testutil.fakeBlobHash("beta")))
+    }
+
+    @Test
+    fun `resume cursor is set after a full run and used automatically on the next one`() = runTest {
+        val roundOneCommits = listOf(
+            io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c2".padEnd(40, '0'), timestampEpochSeconds = 200, files = mapOf("b.txt" to "beta")),
+            io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c1".padEnd(40, '0'), timestampEpochSeconds = 100, files = mapOf("a.txt" to "alpha")),
+        )
+        val roundOneFiles = mapOf("a.txt" to "alpha", "b.txt" to "beta")
+        val firstResult = indexerForRepo(FakeGitRepository(roundOneFiles, roundOneCommits)).index("HEAD")
+        assertEquals(2, firstResult.commitsProcessed)
+        assertEquals(io.github.jsilvanus.gitsema.model.CommitHash("c2".padEnd(40, '0')), metadataStore.getResumeCursor("HEAD"))
+
+        // History grew by one commit -- a real second run against the same
+        // ref should only walk the new one, not re-walk c1/c2, because
+        // `since` defaults to the stored resume cursor when not given.
+        val roundTwoCommits = listOf(
+            io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c3".padEnd(40, '0'), timestampEpochSeconds = 300, files = mapOf("c.txt" to "gamma")),
+        ) + roundOneCommits
+        val roundTwoFiles = roundOneFiles + ("c.txt" to "gamma")
+        val secondResult = indexerForRepo(FakeGitRepository(roundTwoFiles, roundTwoCommits)).index("HEAD")
+
+        assertEquals(1, secondResult.commitsProcessed, "only the new commit should be walked, not the two already-processed ones")
+        assertEquals(io.github.jsilvanus.gitsema.model.CommitHash("c3".padEnd(40, '0')), metadataStore.getResumeCursor("HEAD"))
+        // The new blob should still have been indexed correctly despite the narrower commit walk.
+        assertEquals(1, secondResult.blobsIndexed)
+    }
+
+    @Test
+    fun `an explicit since parameter overrides the stored resume cursor`() = runTest {
+        val commits = listOf(
+            io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c2".padEnd(40, '0'), timestampEpochSeconds = 200, files = mapOf("b.txt" to "beta")),
+            io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c1".padEnd(40, '0'), timestampEpochSeconds = 100, files = mapOf("a.txt" to "alpha")),
+        )
+        val files = mapOf("a.txt" to "alpha", "b.txt" to "beta")
+        metadataStore.setResumeCursor("HEAD", io.github.jsilvanus.gitsema.model.CommitHash("c2".padEnd(40, '0'))) // pretend a previous run already got this far
+
+        val result = indexerForRepo(FakeGitRepository(files, commits))
+            .index("HEAD", since = io.github.jsilvanus.gitsema.model.CommitHash("c1".padEnd(40, '0'))) // explicitly force re-walking from further back
+
+        assertEquals(1, result.commitsProcessed, "explicit since=c1 should only exclude c1 itself, leaving c2 to walk")
+    }
+
+    @Test
+    fun `an already-embedded blob resurfacing at a new path gets that path registered`() = runTest {
+        // Round 1: index "shared content" only under a.txt.
+        val roundOneCommits = listOf(
+            io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c1".padEnd(40, '0'), timestampEpochSeconds = 100, files = mapOf("a.txt" to "shared content")),
+        )
+        indexerForRepo(FakeGitRepository(mapOf("a.txt" to "shared content"), roundOneCommits)).index("HEAD")
+        val hash = io.github.jsilvanus.gitsema.testutil.fakeBlobHash("shared content")
+        assertEquals(listOf("a.txt"), metadataStore.pathsFor(hash).map { it.value })
+
+        // Round 2: a NEW commit reuses the exact same content under a NEW
+        // path (b.txt) -- the blob is already embedded (content-addressed,
+        // same hash), so it won't go through the embedding loop again, but
+        // its new path must still be registered via the commit-diff loop.
+        val roundTwoCommits = listOf(
+            io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c2".padEnd(40, '0'), timestampEpochSeconds = 200, files = mapOf("b.txt" to "shared content")),
+        ) + roundOneCommits
+        val secondResult = indexerForRepo(FakeGitRepository(mapOf("a.txt" to "shared content", "b.txt" to "shared content"), roundTwoCommits))
+            .index("HEAD")
+
+        assertEquals(0, secondResult.blobsIndexed, "the blob content is unchanged -- no new embedding work")
+        assertEquals(setOf("a.txt", "b.txt"), metadataStore.pathsFor(hash).map { it.value }.toSet())
     }
 }

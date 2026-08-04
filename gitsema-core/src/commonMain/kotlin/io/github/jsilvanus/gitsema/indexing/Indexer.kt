@@ -7,9 +7,11 @@ import io.github.jsilvanus.gitsema.embedding.EmbeddingOrchestrator
 import io.github.jsilvanus.gitsema.embedding.EmbeddingProvider
 import io.github.jsilvanus.gitsema.git.GitRepository
 import io.github.jsilvanus.gitsema.model.BlobHash
+import io.github.jsilvanus.gitsema.model.CommitHash
 import io.github.jsilvanus.gitsema.model.IndexProgress
 import io.github.jsilvanus.gitsema.model.IndexResult
 import io.github.jsilvanus.gitsema.model.RepoPath
+import io.github.jsilvanus.gitsema.storage.CommitMeta
 import io.github.jsilvanus.gitsema.storage.EmbedConfigMeta
 import io.github.jsilvanus.gitsema.storage.FtsStore
 import io.github.jsilvanus.gitsema.storage.MetadataStore
@@ -19,21 +21,36 @@ import kotlinx.datetime.Clock
 
 /**
  * Ties the git, chunking, embedding, and storage seams together
- * (kotlin-port.md §7). Scope note: this is the blob-indexing pipeline only —
- * dedup, chunk, embed, store vector + FTS content + path. Commit metadata
- * (`streamCommits`, the equivalent of gitsema-TS's `commitMap.ts`) is a
- * separate, not-yet-built slice; until it lands, [MetadataStore.firstSeenFor]
- * has nothing to return and ranking's recency signal degrades to neutral
- * (kotlin-port.md §4.2/constraint 5's "mark as degraded" principle applied to
- * a sub-signal, not just whole results) rather than silently pretending to work.
+ * (kotlin-port.md §7): blob dedup/chunk/embed/store, AND commit-mapping
+ * (`streamCommits`, gitsema-TS's `commitMap.ts` equivalent) — every commit
+ * reachable from [ref] is recorded, every blob it changed is linked and has
+ * its path registered (regardless of whether that blob needed embedding this
+ * run, closing a real gap the blob-only loop alone would have: an
+ * already-embedded blob resurfacing under a new path used to not get that
+ * path registered). This is what makes [MetadataStore.firstSeenFor] real, so
+ * ranking's recency signal (§4.2) actually activates instead of always
+ * degrading.
  *
- * Only [io.github.jsilvanus.gitsema.chunking.FileChunker] is wired in Tier 1
- * (per the porting brief's "chunking (file strategy first)") — the
- * context-limit fallback chain (kotlin-port.md §2.4: function chunker then
- * fixed 1500/800) needs the function/fixed chunkers, not yet built, so an
- * oversized-context failure is currently just a failed blob, counted in
- * stats, not retried with a smaller chunk. Documented here, not silently
- * dropped.
+ * [ref]'s resume cursor (kotlin-port.md §7.2, Decision C #3) is read
+ * automatically when [since] isn't given, and written back to the tip commit
+ * only after the WHOLE commit stream for this run has been consumed — an
+ * interrupted run leaves the previous cursor untouched, so the next run
+ * conservatively re-walks from the last known-good point rather than
+ * gitsema-TS's insertion-order bug (which could point at the wrong commit
+ * entirely). This is coarser than fully fine-grained per-commit durability
+ * would be (a killed run re-walks the whole in-flight window next time, not
+ * just what's left) — a deliberate simplicity/correctness tradeoff, not an
+ * oversight: individual blob writes are still durable per-blob regardless
+ * (§7.2/§8.2), so re-walking never re-embeds anything, only re-visits
+ * already-safe ground.
+ *
+ * Only [io.github.jsilvanus.gitsema.chunking.FileChunker] is wired for
+ * embedding in Tier 1 (per the porting brief's "chunking (file strategy
+ * first)") — the context-limit fallback chain (kotlin-port.md §2.4: function
+ * chunker then fixed 1500/800) needs chunk-level vector storage, which
+ * [VectorStore] doesn't support yet (see [io.github.jsilvanus.gitsema.chunking.FixedChunker]'s
+ * doc comment); an oversized-context failure is currently just a failed
+ * blob, counted in stats, not retried with a smaller chunk.
  */
 class Indexer(
     private val repository: GitRepository,
@@ -50,7 +67,7 @@ class Indexer(
 ) {
     private val orchestrator = EmbeddingOrchestrator(provider, concurrency, batchSize)
 
-    suspend fun index(ref: String, since: io.github.jsilvanus.gitsema.model.CommitHash? = null, onProgress: (IndexProgress) -> Unit = {}): IndexResult {
+    suspend fun index(ref: String, since: CommitHash? = null, onProgress: (IndexProgress) -> Unit = {}): IndexResult {
         metadataStore.upsertEmbedConfig(
             EmbedConfigMeta(
                 model = provider.modelId,
@@ -61,12 +78,39 @@ class Indexer(
             ),
         )
 
+        val effectiveSince = since ?: metadataStore.getResumeCursor(ref)
+
         var commitsProcessed = 0
         var blobsSeen = 0
         var blobsIndexed = 0
         var blobsSkipped = 0
         var blobsFailed = 0
         var blobsOversized = 0
+
+        // Same buffering caveat as the blob stream below: lightweight commit
+        // metadata only (never blob content), megabytes at gitsema's target
+        // scale, not the §9 problem -- but a true fix processes this Flow in
+        // bounded windows rather than draining it up front.
+        var tipCommit: CommitHash? = null
+        val commits = repository.streamCommits(ref, effectiveSince).toList()
+        for (commit in commits) {
+            if (tipCommit == null) tipCommit = commit.hash // first emitted, when since is null, is ref's current tip
+            metadataStore.putCommit(
+                CommitMeta(
+                    hash = commit.hash,
+                    timestampEpochSeconds = commit.timestampEpochSeconds,
+                    authorName = commit.authorName,
+                    authorEmail = commit.authorEmail,
+                    message = commit.message,
+                ),
+            )
+            for (changed in commit.changedBlobs) {
+                metadataStore.linkBlobCommit(changed.blobHash, commit.hash)
+                metadataStore.addPath(changed.blobHash, changed.path)
+            }
+            metadataStore.markCommitIndexed(commit.hash, clock())
+            commitsProcessed++
+        }
 
         // Known departure from constraint 4 ("never buffer entire history"),
         // shared with gitsema-TS's own indexer (kotlin-port.md Decision C #2,
@@ -80,7 +124,17 @@ class Indexer(
         // long-term. A true fix processes GitRepository.streamBlobs' Flow in
         // bounded windows without a full upfront collect; tracked as
         // follow-up work, not silently accepted as done.
-        val entries = repository.streamBlobs(ref, since).toList()
+        //
+        // Uses effectiveSince (not the raw `since` parameter) so the resume
+        // cursor bounds this walk the same way it bounds the commit walk
+        // above -- a blob only reachable through already-processed history
+        // is correctly skipped, while a blob still reachable via a NEW
+        // commit (even at an already-known path, or an unchanged blob
+        // surfacing under a genuinely new one) is still visited: JGit's
+        // ObjectWalk excludes an object only when EVERY path to it runs
+        // through commits marked uninteresting, not merely because it also
+        // happens to be reachable from old history.
+        val entries = repository.streamBlobs(ref, effectiveSince).toList()
         for (batch in entries.chunked(dedupBatchSize)) {
             blobsSeen += batch.size
             val batchHashes = batch.map { it.blobHash }
@@ -127,6 +181,14 @@ class Indexer(
             }
 
             onProgress(IndexProgress(commitsProcessed, blobsSeen, blobsIndexed, blobsFailed))
+        }
+
+        // Only reached after the entire commit AND blob streams for this run
+        // have been consumed without an unhandled exception -- an
+        // interruption anywhere above skips this, leaving the previous
+        // cursor (or none) in place for the next run to resume from.
+        if (tipCommit != null) {
+            metadataStore.setResumeCursor(ref, tipCommit)
         }
 
         return IndexResult(
