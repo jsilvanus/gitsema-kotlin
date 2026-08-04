@@ -3,6 +3,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
+    alias(libs.plugins.android.library)
     alias(libs.plugins.sqldelight)
     `maven-publish`
 }
@@ -15,25 +16,17 @@ group = "io.github.jsilvanus"
 version = (findProperty("version") as String?)?.takeUnless { it == "unspecified" } ?: "0.1.0-SNAPSHOT"
 
 // ---------------------------------------------------------------------------
-// Android target: NOT wired in this build file yet.
+// Android target: wired and building. Requires an Android SDK — `sdk.dir` in
+// local.properties, or ANDROID_HOME. `./gradlew build` on a machine without
+// one will fail at configuration time; that's AGP's behaviour, not something
+// this file can paper over.
 //
-// The porting brief requires JVM + Android targets. This sandboxed dev
-// environment has neither an Android SDK nor network access to Google's Maven
-// (dl.google.com is blocked by the outbound proxy here — confirmed via a
-// direct request, not assumed), so the Android Gradle Plugin cannot be
-// resolved, let alone an SDK configured. Wiring `androidTarget()` here without
-// being able to build or test it would be committing unverified configuration.
-//
-// The source layout already anticipates this: `jvmAndroidMain` (below) holds
-// everything that needs java.* but is shared between jvm() and a future
-// androidTarget() — JGit usage, later the SQLite/vector-file code. Adding
-// Android for real, once run somewhere with SDK + AGP access, is:
-//   1. `alias(libs.plugins.android.library)` in the plugins block above.
-//   2. `androidTarget { ... }` next to `jvm { ... }` below.
-//   3. An `androidMain` source set with `dependsOn(jvmAndroidMain)`.
-//   4. The `android { namespace = ...; compileSdk = ...; minSdk = ... }` block.
-// No commonMain or jvmAndroidMain code needs to change for this — see
-// docs/design/kotlin-port.md §7.3/§8 for why the split was made this way.
+// The source split it was designed around is unchanged: `jvmAndroidMain`
+// (below) holds everything that needs java.* but is shared between jvm() and
+// androidTarget() — JGit, the memory-mapped vector store — while commonMain
+// stays free of java.*. Nothing in either source set had to change to add
+// this target; the only genuinely Android-specific code is the SqlDriver
+// `actual` (kotlin-port.md §6.4's storage seam). See androidMain/.
 // ---------------------------------------------------------------------------
 
 kotlin {
@@ -42,6 +35,17 @@ kotlin {
         compilerOptions {
             jvmTarget.set(JvmTarget.JVM_17)
         }
+    }
+
+    @OptIn(ExperimentalKotlinGradlePluginApi::class)
+    androidTarget {
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_17)
+        }
+        // One publication ("androidRelease") rather than debug+release: a
+        // consumer of this library has no use for a debug variant of an
+        // index, and publishing both doubles the artifact set for nothing.
+        publishLibraryVariants("release")
     }
 
     sourceSets {
@@ -83,6 +87,42 @@ kotlin {
                 implementation(kotlin("test-junit"))
             }
         }
+
+        val androidMain by getting {
+            dependsOn(jvmAndroidMain)
+            dependencies {
+                implementation(libs.sqldelight.android.driver)
+                // FrameworkSQLiteDatabase (the SupportSQLiteDatabase wrapper
+                // around a raw android.database.sqlite.SQLiteDatabase) is what
+                // lets the driver be opened by absolute path with no Context —
+                // see SqlDriverFactory.android.kt. Declared explicitly rather
+                // than leaned on transitively through android-driver.
+                implementation(libs.androidx.sqlite.framework)
+            }
+        }
+        // Android unit tests (JVM-hosted, no device) run commonTest's pure-Kotlin
+        // suites against the Android variant's compilation. They cannot cover
+        // anything touching android.database.sqlite or a real repository on
+        // device — that needs connectedAndroidTest against an emulator/device,
+        // which this module does not yet have. Stated so the green
+        // `testDebugUnitTest` is not mistaken for on-device verification.
+        val androidUnitTest by getting {
+            dependencies {
+                implementation(kotlin("test-junit"))
+            }
+        }
+    }
+}
+
+android {
+    namespace = "io.github.jsilvanus.gitsema"
+    compileSdk = libs.versions.android.compileSdk.get().toInt()
+    defaultConfig {
+        minSdk = libs.versions.android.minSdk.get().toInt()
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 }
 

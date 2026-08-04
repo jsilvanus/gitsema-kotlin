@@ -3,10 +3,18 @@ kotlin = "2.0.21"
 coroutines = "1.9.0"
 jgit = "6.10.0.202406032230-r"
 kotlinx-datetime = "0.6.1"
-android-gradle-plugin = "8.6.1"
+# 8.5.x, not something newer: Kotlin 2.0.21's Gradle plugin tests against AGP
+# 8.5 at the top end and warns on every build above it ("higher than the
+# maximum known to the Kotlin Gradle Plugin"). Bump this together with Kotlin,
+# not ahead of it.
+android-gradle-plugin = "8.5.2"
 android-compileSdk = "34"
 android-minSdk = "26"
 junit = "4.13.2"
+# Pinned to what sqldelight 2.0.2's android-driver is built against; the
+# FrameworkSQLiteDatabase(SQLiteDatabase) constructor SqlDriverFactory.android.kt
+# uses is public API in this line.
+androidx-sqlite = "2.3.1"
 sqldelight = "2.0.2"
 
 [libraries]
@@ -19,6 +27,7 @@ sqldelight-runtime = { module = "app.cash.sqldelight:runtime", version.ref = "sq
 sqldelight-coroutines = { module = "app.cash.sqldelight:coroutines-extensions", version.ref = "sqldelight" }
 sqldelight-jvm-driver = { module = "app.cash.sqldelight:sqlite-driver", version.ref = "sqldelight" }
 sqldelight-android-driver = { module = "app.cash.sqldelight:android-driver", version.ref = "sqldelight" }
+androidx-sqlite-framework = { module = "androidx.sqlite:sqlite-framework", version.ref = "androidx-sqlite" }
 
 [plugins]
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
