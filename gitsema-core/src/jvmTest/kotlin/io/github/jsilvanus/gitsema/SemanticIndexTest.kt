@@ -143,6 +143,25 @@ class SemanticIndexTest {
     }
 
     @Test
+    fun `status reports lastIndexedCommit from durable storage, surviving a fresh instance sharing the same database`() = runTest {
+        // PR #1 review finding #3: a process-local "last indexed ref" field
+        // under-reports after process death, which on Android (Aidos's
+        // target) is routine rather than exceptional. Simulate that by
+        // building a brand-new GitsemaSemanticIndex against the SAME
+        // underlying storage -- it has never called index() itself, so if
+        // status() relied on any in-process state, this would come back
+        // null despite the durable resume cursor being right there.
+        val database = sharedDatabase()
+        val files = mapOf("a.txt" to "alpha")
+        val index = indexOn(database, files)
+        index.index("HEAD")
+
+        val freshIndexOnSameStorage = indexOn(database, files)
+
+        assertEquals("fakehead".padEnd(40, '0'), freshIndexOnSameStorage.status().lastIndexedCommit?.value)
+    }
+
+    @Test
     fun `branch filtering restricts hybrid search results to blobs indexed under that ref`() = runTest {
         val index = buildIndex(mapOf("a.txt" to "unique searchable content about widgets"))
         index.index("main")

@@ -3,12 +3,16 @@ package io.github.jsilvanus.gitsema.indexing
 import io.github.jsilvanus.gitsema.chunking.FileChunker
 import io.github.jsilvanus.gitsema.db.GitsemaDatabase
 import io.github.jsilvanus.gitsema.embedding.embed
+import io.github.jsilvanus.gitsema.storage.CommitMeta
 import io.github.jsilvanus.gitsema.storage.FlatFileVectorStore
+import io.github.jsilvanus.gitsema.storage.MetadataStore
 import io.github.jsilvanus.gitsema.storage.SqliteFtsStore
 import io.github.jsilvanus.gitsema.storage.SqliteMetadataStore
 import io.github.jsilvanus.gitsema.storage.createSqlDriver
 import io.github.jsilvanus.gitsema.testutil.FakeEmbeddingProvider
 import io.github.jsilvanus.gitsema.testutil.FakeGitRepository
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Before
@@ -239,7 +243,7 @@ class IndexerTest {
             io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c1".padEnd(40, '0'), timestampEpochSeconds = 100, files = mapOf("a.txt" to "alpha")),
         )
         val files = mapOf("a.txt" to "alpha", "b.txt" to "beta")
-        metadataStore.setResumeCursor("HEAD", io.github.jsilvanus.gitsema.model.CommitHash("c2".padEnd(40, '0'))) // pretend a previous run already got this far
+        metadataStore.setResumeCursor("HEAD", io.github.jsilvanus.gitsema.model.CommitHash("c2".padEnd(40, '0')), 200L) // pretend a previous run already got this far
 
         val result = indexerForRepo(FakeGitRepository(files, commits))
             .index("HEAD", since = io.github.jsilvanus.gitsema.model.CommitHash("c1".padEnd(40, '0'))) // explicitly force re-walking from further back
@@ -357,5 +361,44 @@ class IndexerTest {
 
         assertEquals(setOf(io.github.jsilvanus.gitsema.testutil.fakeBlobHash("alpha"), io.github.jsilvanus.gitsema.testutil.fakeBlobHash("beta")), metadataStore.blobHashesOnBranch("main"))
         assertTrue(metadataStore.blobHashesOnBranch("some-other-branch-never-indexed").isEmpty())
+    }
+
+    // PR #1 review finding #1: the commit-mapping loop calls no embedding
+    // step, so whether it's cancellable used to depend entirely on whether
+    // its store calls happened to redispatch. This drives a real
+    // cancellation through the middle of that loop and checks the run stops
+    // short and leaves the resume cursor untouched, rather than either
+    // running to completion or silently corrupting state.
+    @Test
+    fun `cancelling index() mid commit-walk leaves it incomplete and the resume cursor untouched`() = runTest {
+        val commits = (1..20).map { i ->
+            io.github.jsilvanus.gitsema.testutil.FakeCommit(hash = "c$i".padEnd(40, '0'), timestampEpochSeconds = i.toLong(), files = emptyMap())
+        }
+        val repo = FakeGitRepository(emptyMap(), commits)
+
+        lateinit var job: Job
+        var putCommitCalls = 0
+        val cancellingStore = object : MetadataStore by metadataStore {
+            override suspend fun putCommit(commit: CommitMeta) {
+                putCommitCalls++
+                if (putCommitCalls == 3) job.cancel()
+                metadataStore.putCommit(commit)
+            }
+        }
+        val indexer = Indexer(
+            repository = repo,
+            provider = FakeEmbeddingProvider(),
+            metadataStore = cancellingStore,
+            vectorStore = vectorStore,
+            ftsStore = ftsStore,
+            chunker = FileChunker(),
+        )
+
+        job = launch { indexer.index("HEAD") }
+        job.join()
+
+        assertTrue(job.isCancelled, "the run should have been cancelled, not completed")
+        assertTrue(putCommitCalls < commits.size, "cancellation must stop the commit walk before it runs to completion (saw $putCommitCalls of ${commits.size} commits)")
+        assertEquals(null, metadataStore.getResumeCursor("HEAD"), "a cancelled run must leave the resume cursor untouched, so the next run conservatively re-walks")
     }
 }

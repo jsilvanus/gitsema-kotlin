@@ -9,13 +9,21 @@
 -- processed successfully -- an interrupted run leaves it untouched, so the
 -- next run conservatively re-walks from the last known-good point rather
 -- than risking a gap.
+-- updated_at backs mostRecentRef: which ref a caller most recently finished
+-- indexing, derived from durable storage rather than an in-process variable
+-- (PR #1 review finding: a process-local "last indexed ref" under-reports
+-- after Android process death, which is routine there, not exceptional).
 CREATE TABLE resume_cursor (
     ref TEXT NOT NULL PRIMARY KEY,
-    commit_hash TEXT NOT NULL
+    commit_hash TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 
 setResumeCursor:
-INSERT OR REPLACE INTO resume_cursor(ref, commit_hash) VALUES (?, ?);
+INSERT OR REPLACE INTO resume_cursor(ref, commit_hash, updated_at) VALUES (?, ?, ?);
 
 getResumeCursor:
 SELECT commit_hash FROM resume_cursor WHERE ref = ?;
+
+mostRecentRef:
+SELECT ref FROM resume_cursor ORDER BY updated_at DESC LIMIT 1;

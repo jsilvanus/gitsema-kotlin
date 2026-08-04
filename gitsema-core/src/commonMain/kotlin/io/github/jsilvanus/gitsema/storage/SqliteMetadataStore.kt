@@ -91,12 +91,17 @@ class SqliteMetadataStore(private val database: GitsemaDatabase) : MetadataStore
         }
     }
 
-    override suspend fun setResumeCursor(ref: String, commitHash: CommitHash) = withContext(Dispatchers.IO) {
-        resumeCursor.setResumeCursor(ref, commitHash.value)
-    }
+    override suspend fun setResumeCursor(ref: String, commitHash: CommitHash, updatedAtEpochSeconds: Long) =
+        withContext(Dispatchers.IO) {
+            resumeCursor.setResumeCursor(ref, commitHash.value, updatedAtEpochSeconds)
+        }
 
     override suspend fun getResumeCursor(ref: String): CommitHash? = withContext(Dispatchers.IO) {
         resumeCursor.getResumeCursor(ref).executeAsOneOrNull()?.let { CommitHash(it) }
+    }
+
+    override suspend fun mostRecentlyIndexedRef(): String? = withContext(Dispatchers.IO) {
+        resumeCursor.mostRecentRef().executeAsOneOrNull()
     }
 
     override suspend fun addBlobBranch(blobHash: BlobHash, ref: String) = withContext(Dispatchers.IO) {

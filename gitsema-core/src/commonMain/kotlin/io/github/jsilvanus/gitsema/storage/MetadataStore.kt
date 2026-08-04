@@ -56,8 +56,17 @@ interface MetadataStore {
      * interrupted run should leave the previous cursor untouched so the next
      * run conservatively re-walks from the last known-good point.
      */
-    suspend fun setResumeCursor(ref: String, commitHash: CommitHash)
+    suspend fun setResumeCursor(ref: String, commitHash: CommitHash, updatedAtEpochSeconds: Long)
     suspend fun getResumeCursor(ref: String): CommitHash?
+
+    /**
+     * The ref whose [setResumeCursor] was most recently called, i.e. the
+     * ref a caller most recently finished indexing — durable, so it survives
+     * process death (PR #1 review finding #3: an in-process "last indexed
+     * ref" variable under-reports after eviction, which on Android is
+     * routine). Null if [setResumeCursor] has never been called.
+     */
+    suspend fun mostRecentlyIndexedRef(): String?
 
     /**
      * Records that [blobHash] was seen while indexing under [ref] — see the

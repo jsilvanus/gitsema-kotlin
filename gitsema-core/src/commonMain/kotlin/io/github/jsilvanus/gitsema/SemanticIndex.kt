@@ -59,27 +59,25 @@ class GitsemaSemanticIndex(
     )
     private val searchEngine = SearchEngine(metadataStore, vectorStore, ftsStore, provider)
 
-    // status() (porting brief's interface) takes no ref, but the resume
-    // cursor is keyed by one (kotlin-port.md §7.2) -- remembering the most
-    // recently indexed ref in-process is the simplest honest way to answer
-    // "what did status() index," without inventing a param the brief's
-    // sketch doesn't have. Null until index() has been called at least once.
-    private var lastIndexedRef: String? = null
-
-    override suspend fun index(ref: String, onProgress: (IndexProgress) -> Unit): IndexResult {
-        val result = indexer.index(ref, since = null, onProgress = onProgress)
-        lastIndexedRef = ref
-        return result
-    }
+    override suspend fun index(ref: String, onProgress: (IndexProgress) -> Unit): IndexResult =
+        indexer.index(ref, since = null, onProgress = onProgress)
 
     override suspend fun search(query: Query): List<Match> = searchEngine.search(query)
 
+    // status() (porting brief's interface) takes no ref, but the resume
+    // cursor is keyed by one (kotlin-port.md §7.2) -- lastIndexedCommit is
+    // derived from MetadataStore.mostRecentlyIndexedRef(), which is durable
+    // (PR #1 review finding #3: an in-process "last indexed ref" variable
+    // under-reports after process death, which on Android is routine rather
+    // than exceptional -- this makes status() honest across restarts without
+    // inventing a status(ref:) param the brief's sketch doesn't have).
     override suspend fun status(): IndexStatus {
         val embedConfig = metadataStore.embedConfigFor(provider.modelId)
+        val mostRecentRef = metadataStore.mostRecentlyIndexedRef()
         return IndexStatus(
             blobCount = metadataStore.blobCount(),
             embeddedBlobCount = vectorStore.countForModel(provider.modelId),
-            lastIndexedCommit = lastIndexedRef?.let { metadataStore.getResumeCursor(it) },
+            lastIndexedCommit = mostRecentRef?.let { metadataStore.getResumeCursor(it) },
             embeddingModel = embedConfig?.model,
             embeddingDimensions = embedConfig?.dimensions,
         )

@@ -18,6 +18,8 @@ import io.github.jsilvanus.gitsema.storage.EmbedConfigMeta
 import io.github.jsilvanus.gitsema.storage.FtsStore
 import io.github.jsilvanus.gitsema.storage.MetadataStore
 import io.github.jsilvanus.gitsema.storage.VectorStore
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.toList
 import kotlinx.datetime.Clock
 
@@ -65,6 +67,15 @@ import kotlinx.datetime.Clock
  * `BlobBranches.sq` for the precise, deliberately narrower-than-full-git
  * semantic this claims (indexed-under-this-ref-name, not full branch
  * topology).
+ *
+ * [index] is cooperatively cancellable: [EmbeddingOrchestrator] already
+ * rethrows [kotlinx.coroutines.CancellationException] ahead of its generic
+ * failure handling, and both loops here call `ensureActive()` explicitly
+ * (once per commit, once per [dedupBatchSize] blob batch) rather than
+ * relying on their store calls happening to redispatch. A cancellation mid
+ * run leaves the previous [MetadataStore.setResumeCursor] value untouched
+ * (per the resume-cursor contract above), so the next run re-walks
+ * conservatively rather than re-embedding anything already durably written.
  */
 class Indexer(
     private val repository: GitRepository,
@@ -108,6 +119,13 @@ class Indexer(
         var tipCommit: CommitHash? = null
         val commits = repository.streamCommits(ref, effectiveSince).toList()
         for (commit in commits) {
+            // PR #1 review finding #1: this loop's own body never suspends
+            // (it only calls store writes), so whether it's cancellable used
+            // to depend entirely on whether those store calls happened to
+            // redispatch. Checking explicitly here makes cancellation
+            // observable every iteration, regardless of the caller's
+            // dispatcher or the store implementation's internals.
+            currentCoroutineContext().ensureActive()
             if (tipCommit == null) tipCommit = commit.hash // first emitted, when since is null, is ref's current tip
             metadataStore.putCommit(
                 CommitMeta(
@@ -150,6 +168,11 @@ class Indexer(
         // happens to be reachable from old history.
         val entries = repository.streamBlobs(ref, effectiveSince).toList()
         for (batch in entries.chunked(dedupBatchSize)) {
+            // Same reasoning as the commit loop above -- checked once per
+            // dedupBatchSize chunk (not per blob) to keep the overhead
+            // negligible while still bounding how much in-flight work a
+            // cancellation has to wait out.
+            currentCoroutineContext().ensureActive()
             blobsSeen += batch.size
             val batchHashes = batch.map { it.blobHash }
             val toEmbed = vectorStore.filterNewBlobs(batchHashes, provider.modelId)
@@ -226,7 +249,7 @@ class Indexer(
         // interruption anywhere above skips this, leaving the previous
         // cursor (or none) in place for the next run to resume from.
         if (tipCommit != null) {
-            metadataStore.setResumeCursor(ref, tipCommit)
+            metadataStore.setResumeCursor(ref, tipCommit, clock())
         }
 
         return IndexResult(
