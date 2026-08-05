@@ -2,7 +2,8 @@
 
 A Kotlin Multiplatform (JVM + Android) port of [gitsema](https://github.com/jsilvanus/gitsema)'s
 indexing and search core, built as a standalone library for
-[Aidos](https://github.com/jsilvanus/aidos).
+[Aidos](https://github.com/jsilvanus/aidos) — plus `gitsema-cli`, a JVM-only
+command-line tool that drives it on the desktop.
 
 **Status: Tier 1 complete and operational on the JVM target; `androidTarget()`
 is wired and compiling, but has never run on a device** — index → search
@@ -21,7 +22,10 @@ only orients you to what's actually built.
 
 ## What's here so far
 
-`gitsema-core`, the library module:
+Two modules: `gitsema-core` (the KMP library, JVM + Android) and
+`gitsema-cli` (a plain Kotlin/JVM command-line tool that consumes it).
+
+### `gitsema-core`
 
 - **Public API** (`SemanticIndex`, `GitsemaSemanticIndex`) — `index(ref,
   onProgress)`, `search(query)`, `status()`, per the porting brief.
@@ -111,8 +115,8 @@ only orients you to what's actually built.
   [What still needs a device](#what-still-needs-a-device) says what remains
   unproven.
 
-**117 tests passing** (`jvm` target) and **50** (Android `debug`/`release` unit
-tests — `commonTest`'s pure-Kotlin suites compiled against the Android
+**117 tests passing** in `gitsema-core` (`jvm` target), **50** on Android
+(`debug`/`release` unit tests — `commonTest`'s pure-Kotlin suites compiled against the Android
 variant), covering: chunking determinism (both
 strategies) and coverage/overlap invariants, quantization accuracy/determinism,
 storage idempotency and multi-path blobs, FTS sanitization, vector store
@@ -130,6 +134,59 @@ flow chunking and the indexer's streaming behaviour (asserted by observing that
 embedding starts after one window, not after the whole walk), and the eval
 harness's metrics including its deliberate divergence from gitsema-TS on
 repeated-path recall.
+
+**29 tests passing** in `gitsema-cli`, covering argument parsing, both wire
+protocols against a real HTTP server (including OpenAI result re-ordering by
+`index`, and a context-length rejection becoming the typed exception), and the
+commands themselves end to end against a real Git repository — index, search,
+status, eval, the resume cursor making a second run walk nothing, exit codes,
+and the read-only commands surviving a dead endpoint.
+
+
+### `gitsema-cli`
+
+A desktop CLI over the library — the "JVM-only, non-Android module"
+kotlin-port.md §10 Decision A anticipated. Not Kotlin Multiplatform: it targets
+one platform, so KMP structure would buy source sets for targets that will
+never exist.
+
+```bash
+./gradlew :gitsema-cli:installDist
+export PATH="$PWD/gitsema-cli/build/install/gitsema-cli/bin:$PATH"
+
+gitsema index                            # walk history, embed every new blob
+gitsema search "authentication middleware" --top 5
+gitsema status
+gitsema eval cases.jsonl --top 10
+```
+
+| Command | Does |
+|---|---|
+| `index [ref]` | Walks history from `ref` (default `HEAD`) and embeds new blobs, resuming from the stored cursor |
+| `search <query>` | Searches the index; prints coverage first, then ranked results with provenance |
+| `status` | Model, dimensions, resume point, coverage |
+| `eval <cases.jsonl>` | precision@k / recall@k / MRR over gitsema-TS's JSONL case format |
+
+Configuration mirrors gitsema-TS's names, flags overriding environment:
+`--provider` (`ollama`, default, or `http` for any OpenAI-compatible endpoint),
+`--url`, `--model`, `--api-key` — or `GITSEMA_PROVIDER`, `GITSEMA_HTTP_URL`,
+`GITSEMA_MODEL`, `GITSEMA_API_KEY`. Exit codes match too: 0 ok, 1 runtime
+error, 2 usage error. The index lives in `<repo>/.gitsema/`.
+
+Two things worth knowing about how it behaves:
+
+- **The embedding provider lives here, not in the library.** `gitsema-core`
+  never loads or calls a model — that seam exists so the host supplies one
+  (kotlin-port.md §3.1). On Android that host is Aidos; on the desktop it is
+  this module's `HttpEmbeddingProvider`, which is also where the translation
+  from a wire error to `ContextLengthExceededException` belongs: at the
+  boundary that knows the protocol, once, rather than in a library guessing at
+  every provider's error phrasing (Decision C #4).
+- **`status` and keyword search work with no model server running.** An index
+  on disk is a complete answer to "what do you know", and constraints 5 and 6
+  say search is never blocked and FTS works before any model exists. Only
+  `index` requires a reachable endpoint; the read-only commands warn and carry
+  on.
 
 ## What's deliberately not here yet
 
@@ -182,7 +239,8 @@ them is the first item on this list, not the last.
 ## Building
 
 ```bash
-./gradlew build   # builds and tests both targets: jvm and android
+./gradlew build                    # every module, both targets
+./gradlew :gitsema-cli:installDist # a runnable CLI in gitsema-cli/build/install/
 ```
 
 Building the Android target needs an SDK: set `sdk.dir` in

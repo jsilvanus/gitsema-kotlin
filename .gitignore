@@ -5,3 +5,8 @@ local.properties
 *.iml
 .idea/
 .DS_Store
+
+# The CLI writes its index here (index.db + vectors/). Never committed:
+# it is derived data, it is large, and committing it makes the next index
+# run index the index.
+.gitsema/
