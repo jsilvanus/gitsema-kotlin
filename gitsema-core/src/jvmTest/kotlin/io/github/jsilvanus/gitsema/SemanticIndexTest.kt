@@ -54,7 +54,7 @@ class SemanticIndexTest {
     fun `search before indexing returns nothing, not an error`() = runTest {
         val index = buildIndex(emptyMap())
 
-        val results = index.search(Query("anything", topK = 5))
+        val results = index.search(Query("anything", topK = 5)).matches
 
         assertTrue(results.isEmpty())
     }
@@ -79,7 +79,7 @@ class SemanticIndexTest {
         // index is in while embeddings are still catching up.
         val partialIndex = indexOn(database, files, FakeEmbeddingProvider(modelId = "a-different-not-yet-indexed-model"))
 
-        val results = partialIndex.search(Query("authentication middleware", topK = 5))
+        val results = partialIndex.search(Query("authentication middleware", topK = 5)).matches
 
         assertTrue(results.isNotEmpty(), "FTS content exists even though this model has no vectors yet -- search must not return nothing or block")
         assertTrue(results.all { it.degraded }, "every result must be explicitly marked degraded, not silently treated as a full match")
@@ -96,7 +96,7 @@ class SemanticIndexTest {
         )
         index.index("HEAD")
 
-        val results = index.search(Query("authentication middleware", topK = 5))
+        val results = index.search(Query("authentication middleware", topK = 5)).matches
 
         assertTrue(results.isNotEmpty())
         assertTrue(results.all { !it.degraded })
@@ -105,18 +105,73 @@ class SemanticIndexTest {
     }
 
     @Test
+    fun `every search reports coverage, so a half-built index cannot be mistaken for an empty repository`() = runTest {
+        // aidos D29: "A query reports coverage -- blobs indexed over blobs
+        // known. Two counters." The distinction it protects is between "there
+        // is nothing about auth in this repository" and "I have not read most
+        // of it yet", which a bare result list cannot express.
+        val database = sharedDatabase()
+        val files = mapOf("a.txt" to "alpha content", "b.txt" to "beta content")
+        val index = indexOn(database, files)
+
+        val beforeIndexing = index.search(Query("alpha", topK = 5))
+        assertEquals(0L, beforeIndexing.coverage.blobsKnown)
+        assertEquals(0L, beforeIndexing.coverage.blobsEmbedded)
+        assertEquals(0.0, beforeIndexing.coverage.fraction)
+        assertTrue(!beforeIndexing.coverage.isComplete, "an empty index is not complete coverage")
+
+        index.index("HEAD")
+
+        val afterIndexing = index.search(Query("alpha", topK = 5))
+        assertEquals(2L, afterIndexing.coverage.blobsKnown)
+        assertEquals(2L, afterIndexing.coverage.blobsEmbedded)
+        assertEquals(1.0, afterIndexing.coverage.fraction)
+        assertTrue(afterIndexing.coverage.isComplete)
+    }
+
+    @Test
+    fun `coverage is reported per model, so a second model sees its own vectors missing`() = runTest {
+        // Coverage is never a single global number: the same repository is
+        // fully covered for the model that indexed it and uncovered for one
+        // that hasn't, and a query answers for the model it actually ran with.
+        val database = sharedDatabase()
+        val files = mapOf("a.txt" to "alpha content")
+        indexOn(database, files).index("HEAD")
+
+        val otherModel = indexOn(database, files, FakeEmbeddingProvider(modelId = "a-different-not-yet-indexed-model"))
+        val result = otherModel.search(Query("alpha", topK = 5))
+
+        assertEquals(1L, result.coverage.blobsKnown, "the blob is known -- it was walked and recorded")
+        assertEquals(0L, result.coverage.blobsEmbedded, "but this model has embedded none of it")
+        assertTrue(result.degraded, "and the search itself is degraded, reported once for the search, not only per match")
+    }
+
+    @Test
+    fun `degraded is reported on the result envelope, not only on individual matches`() = runTest {
+        // An empty degraded search has no matches to carry the flag, so a
+        // caller checking `matches.all { it.degraded }` would read vacuous
+        // true. The envelope is the only place the answer is always present.
+        val index = buildIndex(emptyMap())
+
+        val result = index.search(Query("anything", topK = 5))
+
+        assertTrue(result.matches.isEmpty())
+        assertTrue(result.degraded, "no vectors exist for this model, so this search was FTS-only")
+    }
+
+    @Test
     fun `status reflects index coverage before and after indexing`() = runTest {
         val index = buildIndex(mapOf("a.txt" to "alpha", "b.txt" to "beta"))
 
         val before = index.status()
-        assertEquals(0L, before.blobCount)
-        assertEquals(0L, before.embeddedBlobCount)
+        assertEquals(0L, before.coverage.blobsKnown)
+        assertEquals(0L, before.coverage.blobsEmbedded)
 
         index.index("HEAD")
 
         val after = index.status()
-        assertEquals(2L, after.blobCount)
-        assertEquals(2L, after.embeddedBlobCount)
+        assertEquals(2L, after.coverage.blobsKnown)
+        assertEquals(2L, after.coverage.blobsEmbedded)
         assertEquals("fake-test-model", after.embeddingModel)
     }
 
@@ -137,7 +192,7 @@ class SemanticIndexTest {
         index.index("HEAD")
         index.index("HEAD") // must not duplicate or corrupt anything
 
-        val results = index.search(Query("widgets", topK = 5))
+        val results = index.search(Query("widgets", topK = 5)).matches
 
         assertEquals(1, results.size)
     }
@@ -166,9 +221,9 @@ class SemanticIndexTest {
         val index = buildIndex(mapOf("a.txt" to "unique searchable content about widgets"))
         index.index("main")
 
-        val onMain = index.search(Query("widgets", topK = 5, branch = "main"))
-        val onOther = index.search(Query("widgets", topK = 5, branch = "never-indexed-branch"))
-        val unfiltered = index.search(Query("widgets", topK = 5))
+        val onMain = index.search(Query("widgets", topK = 5, branch = "main")).matches
+        val onOther = index.search(Query("widgets", topK = 5, branch = "never-indexed-branch")).matches
+        val unfiltered = index.search(Query("widgets", topK = 5)).matches
 
         assertEquals(1, onMain.size, "the blob was indexed under 'main', so branch=main should find it")
         assertTrue(onOther.isEmpty(), "no blob was ever indexed under this branch name")
@@ -184,8 +239,8 @@ class SemanticIndexTest {
         // Same "different, not-yet-vectored model" trick as the degraded-search test above.
         val partialIndex = indexOn(database, files, FakeEmbeddingProvider(modelId = "a-different-not-yet-indexed-model"))
 
-        val onMain = partialIndex.search(Query("authentication middleware", topK = 5, branch = "main"))
-        val onOther = partialIndex.search(Query("authentication middleware", topK = 5, branch = "never-indexed-branch"))
+        val onMain = partialIndex.search(Query("authentication middleware", topK = 5, branch = "main")).matches
+        val onOther = partialIndex.search(Query("authentication middleware", topK = 5, branch = "never-indexed-branch")).matches
 
         assertTrue(onMain.isNotEmpty())
         assertTrue(onMain.all { it.degraded })

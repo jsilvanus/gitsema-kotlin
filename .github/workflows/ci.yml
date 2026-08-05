@@ -1,0 +1,54 @@
+name: CI
+
+# Every push to main and every pull request. Until now the only workflow in
+# this repo was the manual publish one, so nothing checked that a change
+# built — which mattered less when there was one target and matters more now
+# that a change can break Android while leaving the JVM green.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same PR makes the first run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # 17, matching the jvmTarget the build compiles to and what
+          # publish.yml already uses. AGP 8.5 requires 17 or newer.
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # GitHub's ubuntu images ship an Android SDK, but which platform and
+      # build-tools versions are present moves with the image. sdkmanager is
+      # idempotent and a no-op when they are already installed, so asking
+      # explicitly is cheaper than a build that fails whenever the image
+      # rolls forward past what this project pins.
+      - name: Ensure Android SDK packages
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" "build-tools;34.0.0"
+
+      # Builds and tests both targets: jvmTest plus the Android debug/release
+      # unit tests. Does not cover anything needing a device — see the
+      # README's "What still needs a device".
+      - name: Build and test
+        run: ./gradlew build --no-daemon
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: gitsema-core/build/test-results/**/*.xml
+          if-no-files-found: error

@@ -95,10 +95,59 @@ data class IndexResult(
     val blobsOversized: Int,
 )
 
+/**
+ * Two counters: how much of what the index knows about has actually been
+ * embedded for the active model.
+ *
+ * This exists because a consumer cannot otherwise tell "there is no retry
+ * logic in this repository" from "I have not read most of it yet" — the
+ * distinction aidos D29 requires every query to carry, not just a status
+ * call, since it is at answer time that the difference misleads. It rides on
+ * [SearchResult] for exactly that reason.
+ *
+ * [blobsKnown] counts blobs recorded in metadata (seen while walking
+ * history); [blobsEmbedded] counts those with a vector for the model the
+ * query ran against. A different model has different coverage over the same
+ * repository, which is why this is never a single global number.
+ */
+data class IndexCoverage(
+    val blobsEmbedded: Long,
+    val blobsKnown: Long,
+) {
+    /**
+     * `blobsEmbedded / blobsKnown`, or `0.0` when nothing is known yet —
+     * an empty index is 0% covered, not undefined, and callers should not
+     * have to special-case a division they did not ask to perform.
+     */
+    val fraction: Double get() = if (blobsKnown == 0L) 0.0 else blobsEmbedded.toDouble() / blobsKnown.toDouble()
+
+    /** True once every known blob has a vector for this model. */
+    val isComplete: Boolean get() = blobsKnown > 0L && blobsEmbedded >= blobsKnown
+}
+
+/**
+ * What [io.github.jsilvanus.gitsema.SemanticIndex.search] returns: results
+ * plus the coverage they were produced under.
+ *
+ * A bare `List<Match>` cannot answer "how much of the repository did this
+ * look at", and the answer is not a property of any individual match — it is
+ * a property of the search. [degraded] is hoisted here for the same reason:
+ * it describes the whole search (no vectors existed for this model, so this
+ * was FTS-only), and asking a caller to infer that by checking whether every
+ * element happens to be flagged is an invitation to get it wrong. It stays
+ * on [Match] as well, so a match separated from its result set still carries
+ * its own provenance.
+ */
+data class SearchResult(
+    val matches: List<Match>,
+    val coverage: IndexCoverage,
+    /** True when this search ran without any vectors for the active model (constraint 5's FTS-only path). */
+    val degraded: Boolean,
+)
+
 /** Coverage snapshot — kotlin-port.md §12.3 notes gitsema-TS has no model-facing text for this; it is originated here. */
 data class IndexStatus(
-    val blobCount: Long,
-    val embeddedBlobCount: Long,
+    val coverage: IndexCoverage,
     val lastIndexedCommit: CommitHash?,
     val embeddingModel: String?,
     val embeddingDimensions: Int?,

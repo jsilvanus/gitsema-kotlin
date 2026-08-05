@@ -22,6 +22,7 @@ import org.eclipse.jgit.treewalk.CanonicalTreeParser
 import org.eclipse.jgit.treewalk.EmptyTreeIterator
 import org.eclipse.jgit.util.io.DisabledOutputStream
 import java.io.File
+import kotlin.coroutines.CoroutineContext
 
 /**
  * JGit-backed [GitRepository] — the replacement for gitsema-TS's subprocess
@@ -37,15 +38,26 @@ import java.io.File
  * still contains it, which is exactly the buffering/re-walk problem
  * kotlin-port.md Decision C #2 calls out in the TS indexer's own commit-mapping
  * pass. `ObjectWalk` avoids that by construction.
+ *
+ * @param ioContext the context every blocking call here is dispatched to.
+ * Injected rather than hardcoded to `Dispatchers.IO` because the consuming
+ * application owns the resource envelope, not this library (aidos D29: Aidos
+ * owns the lifecycle and "the resource envelope — background dispatcher,
+ * cancellable batches"). A host that must keep this work off its own IO pool,
+ * bound its parallelism, or confine it to one thread can only do so if it
+ * supplies the context. The default preserves the previous behaviour.
  */
-class JGitRepository(repoDir: File) : GitRepository, AutoCloseable {
+class JGitRepository(
+    repoDir: File,
+    private val ioContext: CoroutineContext = Dispatchers.IO,
+) : GitRepository, AutoCloseable {
     private val repository: Repository = FileRepositoryBuilder()
         .setGitDir(File(repoDir, ".git").takeIf { it.exists() } ?: repoDir)
         .readEnvironment()
         .findGitDir()
         .build()
 
-    override suspend fun resolveRef(ref: String): CommitHash? = withContext(Dispatchers.IO) {
+    override suspend fun resolveRef(ref: String): CommitHash? = withContext(ioContext) {
         val id = repository.resolve(ref) ?: return@withContext null
         CommitHash(id.name)
     }
@@ -77,9 +89,9 @@ class JGitRepository(repoDir: File) : GitRepository, AutoCloseable {
                 obj = walk.nextObject()
             }
         }
-    }.flowOn(Dispatchers.IO)
+    }.flowOn(ioContext)
 
-    override suspend fun readBlob(hash: BlobHash, maxBytes: Long): ByteArray? = withContext(Dispatchers.IO) {
+    override suspend fun readBlob(hash: BlobHash, maxBytes: Long): ByteArray? = withContext(ioContext) {
         val id = ObjectId.fromString(hash.value)
         val loader: ObjectLoader = try {
             repository.open(id, Constants.OBJ_BLOB)
@@ -140,7 +152,7 @@ class JGitRepository(repoDir: File) : GitRepository, AutoCloseable {
                 )
             }
         }
-    }.flowOn(Dispatchers.IO)
+    }.flowOn(ioContext)
 
     override fun close() {
         repository.close()

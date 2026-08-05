@@ -2,9 +2,11 @@ package io.github.jsilvanus.gitsema.search
 
 import io.github.jsilvanus.gitsema.embedding.EmbeddingProvider
 import io.github.jsilvanus.gitsema.embedding.embed
+import io.github.jsilvanus.gitsema.model.IndexCoverage
 import io.github.jsilvanus.gitsema.model.Match
 import io.github.jsilvanus.gitsema.model.MatchProvenance
 import io.github.jsilvanus.gitsema.model.Query
+import io.github.jsilvanus.gitsema.model.SearchResult
 import io.github.jsilvanus.gitsema.storage.FtsStore
 import io.github.jsilvanus.gitsema.storage.MetadataStore
 import io.github.jsilvanus.gitsema.storage.VectorStore
@@ -29,6 +31,11 @@ import io.github.jsilvanus.gitsema.storage.VectorStore
  *   full git branch topology). A branch with no recorded blobs (never
  *   indexed by that name) simply yields no results, not an error.
  *
+ * - **Every search reports coverage** ([SearchResult.coverage]): blobs
+ *   embedded for the active model over blobs known. Not a nicety — without
+ *   it a half-built index answers "there is no retry logic here" when the
+ *   truth is "I have not read most of it yet" (aidos D29).
+ *
  * Not yet wired: chunk/symbol-level results (Tier 1 is whole-file only, so
  * [Match.startLine]/[Match.endLine] are placeholder `1..1` spans until a
  * real chunker records real spans).
@@ -40,13 +47,22 @@ class SearchEngine(
     private val provider: EmbeddingProvider,
     private val overFetchMultiplier: Int = 3,
     private val minOverFetch: Int = 50,
+    // Constructor-injected rather than left to rankByThreeSignal/hybridBlend's
+    // own defaults: kotlin-port.md §9.2 point 6 asks for these to be
+    // configurable defaults instead of constants nobody can vary, precisely so
+    // the eval harness (io.github.jsilvanus.gitsema.eval) can measure whether
+    // 0.7/0.2/0.1 and 0.3 hold up at phone-index scale. Defaults unchanged.
+    private val weights: RankingWeights = RankingWeights(),
+    private val bm25Weight: Double = DEFAULT_BM25_WEIGHT,
 ) {
-    suspend fun search(query: Query): List<Match> {
+    suspend fun search(query: Query): SearchResult {
         val vectorCount = vectorStore.countForModel(provider.modelId)
-        if (vectorCount == 0L) {
-            return searchFtsOnly(query)
+        val coverage = IndexCoverage(blobsEmbedded = vectorCount, blobsKnown = metadataStore.blobCount())
+        return if (vectorCount == 0L) {
+            SearchResult(searchFtsOnly(query), coverage, degraded = true)
+        } else {
+            SearchResult(searchHybrid(query), coverage, degraded = false)
         }
-        return searchHybrid(query)
     }
 
     private suspend fun searchFtsOnly(query: Query): List<Match> {
@@ -79,7 +95,7 @@ class SearchEngine(
         val vectorHits = vectorStore.search(provider.modelId, queryVector, overFetch, candidateFilter = branchFilter)
         val ftsHitsRaw = ftsStore.search(query.text, overFetch)
         val ftsHits = if (branchFilter != null) ftsHitsRaw.filter { it.blobHash in branchFilter } else ftsHitsRaw
-        val blended = hybridBlend(vectorHits, ftsHits)
+        val blended = hybridBlend(vectorHits, ftsHits, bm25Weight)
 
         val candidates = blended.map { (hash, score) ->
             RankingCandidate(
@@ -89,7 +105,7 @@ class SearchEngine(
                 firstSeenEpochSeconds = metadataStore.firstSeenFor(hash),
             )
         }
-        val ranked = rankByThreeSignal(query.text, candidates)
+        val ranked = rankByThreeSignal(query.text, candidates, weights)
 
         return ranked.take(query.topK).map { r ->
             Match(
