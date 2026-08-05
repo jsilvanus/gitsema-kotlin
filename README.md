@@ -66,6 +66,11 @@ only orients you to what's actually built.
   blob was already embedded, closing a real gap: an already-indexed blob
   resurfacing at a new path now gets that path registered instead of silently
   not). This is what makes `firstSeenFor`/recency ranking real.
+  - **Streamed, not drained**: both the commit walk and the blob walk are
+    consumed as `Flow`s — the blob walk in bounded `dedupBatchSize` windows
+    via a local `Flow.chunked` — so peak memory is one window regardless of
+    history length, and the embedding pass backpressures the git walk instead
+    of the walk racing ahead of it (Decision C #2, constraint 4).
   - **Resume cursor** (Decision C #3): `ref`'s tip is captured and persisted
     only after a full run completes successfully — not derived from
     write-insertion order the way gitsema-TS's cursor is (a documented bug
@@ -75,11 +80,30 @@ only orients you to what's actually built.
   into gitsema's actual contract — FTS-only + `degraded=true` when no
   vectors exist yet for the active model (constraints 5 & 6), hybrid-blended
   (§4.3) and three-signal-ranked (§4.2, recency included for real now) once
-  they do.
+  they do. Ranking and BM25 weights are constructor-injected, not constants.
+  - **Every search reports coverage.** `search()` returns a `SearchResult`
+    (matches + `IndexCoverage` + a search-level `degraded` flag), not a bare
+    `List<Match>`. Blobs embedded for the active model over blobs known —
+    two counters, per aidos D29, so a half-built index answers "I have not
+    read most of it yet" instead of "there is nothing here". Coverage is
+    per-model: the same repository is covered for the model that indexed it
+    and uncovered for one that has not.
+- **Evaluation** (`eval/`): `evaluate(index, cases, k)` → precision@k,
+  recall@k, MRR, matching gitsema-TS's metric definitions so numbers are
+  comparable. Exists at Tier 1 on purpose (Decision C #7): the 0.7/0.2/0.1
+  ranking weights and 0.3 BM25 weight are inherited from a project that never
+  evaluated them, and this is what makes them checkable rather than assumed.
+  Reports carry the coverage they were measured under — a score against a
+  20%-covered index measures indexing progress, not ranking.
+- **Resource envelope**: every store and `JGitRepository` takes an
+  `ioContext: CoroutineContext` (default `Dispatchers.IO`). The consuming
+  application owns the dispatcher, per aidos D29 — a host that must keep this
+  work off its own IO pool or confine it to one thread can.
+- **CI**: `.github/workflows/ci.yml` builds and tests both targets on every
+  push to `main` and every pull request.
 - **Publishing**: `maven-publish` targeting GitHub Packages, wired but not
   yet used — see `.github/workflows/publish.yml` (manual `workflow_dispatch`
   only, not on every push).
-
 - **Android target**: `androidTarget()` (library, `compileSdk` 34, `minSdk`
   26, one `release` publication), with `androidMain` holding the only two
   genuinely Android-specific pieces — the SQLite driver and a JGit
@@ -87,7 +111,7 @@ only orients you to what's actually built.
   [What still needs a device](#what-still-needs-a-device) says what remains
   unproven.
 
-**98 tests passing** (`jvm` target) and **35** (Android `debug`/`release` unit
+**117 tests passing** (`jvm` target) and **50** (Android `debug`/`release` unit
 tests — `commonTest`'s pure-Kotlin suites compiled against the Android
 variant), covering: chunking determinism (both
 strategies) and coverage/overlap invariants, quantization accuracy/determinism,
@@ -99,8 +123,13 @@ indexer dedup/resumability/the resume-cursor's full lifecycle, ranking and
 hybrid-blend edge cases, end-to-end `SemanticIndex` tests including the
 degraded-search deliverable and `status()`'s coverage reporting, the
 context-limit fallback chain (all-or-nothing per window size, chunk-indexed
-storage, and the function-chunker tier staying skipped), and branch filtering
-across both the hybrid and degraded FTS-only search paths.
+storage, and the function-chunker tier staying skipped), branch filtering
+across both the hybrid and degraded FTS-only search paths, coverage reporting
+on every query (including the per-model and empty-result cases), bounded-window
+flow chunking and the indexer's streaming behaviour (asserted by observing that
+embedding starts after one window, not after the whole walk), and the eval
+harness's metrics including its deliberate divergence from gitsema-TS on
+repeated-path recall.
 
 ## What's deliberately not here yet
 
@@ -108,9 +137,6 @@ across both the hybrid and degraded FTS-only search paths.
   which Decision A in the design doc says not to build on-device without
   asking first. The rest of the fallback chain (whole-file → fixed 1500 →
   fixed 800 → fail, with chunk-indexed vector storage) is wired and tested.
-- **Fully-streaming blob/commit ingestion** — the indexer still drains each
-  git walk into a list before batching (lightweight metadata only, not blob
-  content; documented as a known gap, not silent).
 - **Tier 2** (impact, experts, evolution, and the rest of the analysis
   capabilities) and **Tier 3** (knowledge graph, narrator/LLM, HTTP/MCP,
   multi-repo, multi-tenant auth, remote indexing, Postgres/Qdrant, HNSW) —
