@@ -14,6 +14,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import java.util.PriorityQueue
+import kotlin.coroutines.CoroutineContext
 
 /** Sentinel stored in SQLite for "this is the whole-file vector, not a fallback chunk" (kotlin-port.md §2.4). */
 private const val WHOLE_FILE_CHUNK_INDEX = -1L
@@ -52,10 +53,19 @@ private const val WHOLE_FILE_CHUNK_INDEX = -1L
  * `bestByBlob` never exceeds `topK` entries either — the O(topK) memory
  * guarantee holds for the general case (no chunk-fallback data at all) and
  * the multi-record case alike, not just the common one.
+ *
+ * @param ioContext the context every blocking call here is dispatched to.
+ * Injected rather than hardcoded to `Dispatchers.IO` because the consuming
+ * application owns the resource envelope, not this library (aidos D29: Aidos
+ * owns the lifecycle and "the resource envelope — background dispatcher,
+ * cancellable batches"). A host that must keep this work off its own IO pool,
+ * bound its parallelism, or confine it to one thread can only do so if it
+ * supplies the context. The default preserves the previous behaviour.
  */
 class FlatFileVectorStore(
     private val database: GitsemaDatabase,
     private val vectorDir: File,
+    private val ioContext: CoroutineContext = Dispatchers.IO,
 ) : VectorStore {
     private val writeMutex = Mutex()
 
@@ -64,11 +74,11 @@ class FlatFileVectorStore(
         return File(vectorDir, "vectors-$safeName.bin")
     }
 
-    override suspend fun isIndexed(blobHash: BlobHash, model: String): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun isIndexed(blobHash: BlobHash, model: String): Boolean = withContext(ioContext) {
         database.vectorIndexQueries.isVectorIndexed(blobHash.value, model).executeAsOne()
     }
 
-    override suspend fun filterNewBlobs(blobHashes: List<BlobHash>, model: String): Set<BlobHash> = withContext(Dispatchers.IO) {
+    override suspend fun filterNewBlobs(blobHashes: List<BlobHash>, model: String): Set<BlobHash> = withContext(ioContext) {
         if (blobHashes.isEmpty()) return@withContext emptySet()
         val alreadyIndexed = database.vectorIndexQueries
             .filterNewBlobs(model, blobHashes.map { it.value })
@@ -77,7 +87,7 @@ class FlatFileVectorStore(
         blobHashes.filterNot { it.value in alreadyIndexed }.toHashSet()
     }
 
-    override suspend fun upsert(blobHash: BlobHash, model: String, vector: FloatArray, chunkIndex: Int?) = withContext(Dispatchers.IO) {
+    override suspend fun upsert(blobHash: BlobHash, model: String, vector: FloatArray, chunkIndex: Int?) = withContext(ioContext) {
         writeMutex.withLock {
             val chunkKey = chunkIndex?.toLong() ?: WHOLE_FILE_CHUNK_INDEX
             // Recheck under the lock: two concurrent upserts for the same
@@ -109,7 +119,7 @@ class FlatFileVectorStore(
         queryVector: FloatArray,
         topK: Int,
         candidateFilter: Set<BlobHash>?,
-    ): List<VectorHit> = withContext(Dispatchers.IO) {
+    ): List<VectorHit> = withContext(ioContext) {
         val file = vectorFileFor(model)
         if (!file.exists() || topK <= 0) return@withContext emptyList()
 
@@ -173,7 +183,7 @@ class FlatFileVectorStore(
         heap.sortedByDescending { it.score }
     }
 
-    override suspend fun countForModel(model: String): Long = withContext(Dispatchers.IO) {
+    override suspend fun countForModel(model: String): Long = withContext(ioContext) {
         database.vectorIndexQueries.countForModel(model).executeAsOne()
     }
 }
