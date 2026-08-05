@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 rootProject.name = "gitsema-kotlin"
 
 include(":gitsema-core")
+include(":gitsema-cli")

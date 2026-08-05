@@ -16,6 +16,13 @@ junit = "4.13.2"
 # uses is public API in this line.
 androidx-sqlite = "2.3.1"
 sqldelight = "2.0.2"
+# Pinned to the 1.7.x line, which targets Kotlin 2.0.x — the serialization
+# compiler plugin ships with Kotlin, so this must track the kotlin version.
+serialization = "1.7.3"
+# Matches the slf4j-api line JGit 6.10 depends on. Present only to give SLF4J
+# a binding so JGit stops printing its "Failed to load StaticLoggerBinder"
+# banner on every CLI invocation.
+slf4j = "1.7.36"
 
 [libraries]
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
@@ -23,6 +30,8 @@ kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-t
 kotlinx-datetime = { module = "org.jetbrains.kotlinx:kotlinx-datetime", version.ref = "kotlinx-datetime" }
 jgit = { module = "org.eclipse.jgit:org.eclipse.jgit", version.ref = "jgit" }
 junit = { module = "junit:junit", version.ref = "junit" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
+slf4j-nop = { module = "org.slf4j:slf4j-nop", version.ref = "slf4j" }
 sqldelight-runtime = { module = "app.cash.sqldelight:runtime", version.ref = "sqldelight" }
 sqldelight-coroutines = { module = "app.cash.sqldelight:coroutines-extensions", version.ref = "sqldelight" }
 sqldelight-jvm-driver = { module = "app.cash.sqldelight:sqlite-driver", version.ref = "sqldelight" }
@@ -31,5 +40,7 @@ androidx-sqlite-framework = { module = "androidx.sqlite:sqlite-framework", versi
 
 [plugins]
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 android-library = { id = "com.android.library", version.ref = "android-gradle-plugin" }
 sqldelight = { id = "app.cash.sqldelight", version.ref = "sqldelight" }
