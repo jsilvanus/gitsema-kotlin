@@ -7,8 +7,11 @@ import io.github.jsilvanus.gitsema.indexing.Indexer
 import io.github.jsilvanus.gitsema.model.IndexProgress
 import io.github.jsilvanus.gitsema.model.IndexResult
 import io.github.jsilvanus.gitsema.model.IndexStatus
-import io.github.jsilvanus.gitsema.model.Match
+import io.github.jsilvanus.gitsema.model.IndexCoverage
 import io.github.jsilvanus.gitsema.model.Query
+import io.github.jsilvanus.gitsema.model.SearchResult
+import io.github.jsilvanus.gitsema.search.DEFAULT_BM25_WEIGHT
+import io.github.jsilvanus.gitsema.search.RankingWeights
 import io.github.jsilvanus.gitsema.search.SearchEngine
 import io.github.jsilvanus.gitsema.storage.FtsStore
 import io.github.jsilvanus.gitsema.storage.MetadataStore
@@ -26,7 +29,7 @@ import io.github.jsilvanus.gitsema.storage.VectorStore
  */
 interface SemanticIndex {
     suspend fun index(ref: String, onProgress: (IndexProgress) -> Unit = {}): IndexResult
-    suspend fun search(query: Query): List<Match>
+    suspend fun search(query: Query): SearchResult
     suspend fun status(): IndexStatus
 }
 
@@ -46,6 +49,8 @@ class GitsemaSemanticIndex(
     chunker: Chunker = io.github.jsilvanus.gitsema.chunking.FileChunker(),
     concurrency: Int = 4,
     batchSize: Int = 1,
+    weights: RankingWeights = RankingWeights(),
+    bm25Weight: Double = DEFAULT_BM25_WEIGHT,
 ) : SemanticIndex {
     private val indexer = Indexer(
         repository = repository,
@@ -57,12 +62,19 @@ class GitsemaSemanticIndex(
         concurrency = concurrency,
         batchSize = batchSize,
     )
-    private val searchEngine = SearchEngine(metadataStore, vectorStore, ftsStore, provider)
+    private val searchEngine = SearchEngine(
+        metadataStore = metadataStore,
+        vectorStore = vectorStore,
+        ftsStore = ftsStore,
+        provider = provider,
+        weights = weights,
+        bm25Weight = bm25Weight,
+    )
 
     override suspend fun index(ref: String, onProgress: (IndexProgress) -> Unit): IndexResult =
         indexer.index(ref, since = null, onProgress = onProgress)
 
-    override suspend fun search(query: Query): List<Match> = searchEngine.search(query)
+    override suspend fun search(query: Query): SearchResult = searchEngine.search(query)
 
     // status() (porting brief's interface) takes no ref, but the resume
     // cursor is keyed by one (kotlin-port.md §7.2) -- lastIndexedCommit is
@@ -75,8 +87,10 @@ class GitsemaSemanticIndex(
         val embedConfig = metadataStore.embedConfigFor(provider.modelId)
         val mostRecentRef = metadataStore.mostRecentlyIndexedRef()
         return IndexStatus(
-            blobCount = metadataStore.blobCount(),
-            embeddedBlobCount = vectorStore.countForModel(provider.modelId),
+            coverage = IndexCoverage(
+                blobsEmbedded = vectorStore.countForModel(provider.modelId),
+                blobsKnown = metadataStore.blobCount(),
+            ),
             lastIndexedCommit = mostRecentRef?.let { metadataStore.getResumeCursor(it) },
             embeddingModel = embedConfig?.model,
             embeddingDimensions = embedConfig?.dimensions,
