@@ -20,7 +20,6 @@ import io.github.jsilvanus.gitsema.storage.MetadataStore
 import io.github.jsilvanus.gitsema.storage.VectorStore
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.flow.toList
 import kotlinx.datetime.Clock
 
 /**
@@ -112,13 +111,11 @@ class Indexer(
         var blobsFailed = 0
         var blobsOversized = 0
 
-        // Same buffering caveat as the blob stream below: lightweight commit
-        // metadata only (never blob content), megabytes at gitsema's target
-        // scale, not the §9 problem -- but a true fix processes this Flow in
-        // bounded windows rather than draining it up front.
+        // Collected, not drained: the commit stream is consumed one commit at
+        // a time, so peak memory is a single CommitInfo regardless of how much
+        // history this run covers.
         var tipCommit: CommitHash? = null
-        val commits = repository.streamCommits(ref, effectiveSince).toList()
-        for (commit in commits) {
+        repository.streamCommits(ref, effectiveSince).collect { commit ->
             // PR #1 review finding #1: this loop's own body never suspends
             // (it only calls store writes), so whether it's cancellable used
             // to depend entirely on whether those store calls happened to
@@ -144,18 +141,13 @@ class Indexer(
             commitsProcessed++
         }
 
-        // Known departure from constraint 4 ("never buffer entire history"),
-        // shared with gitsema-TS's own indexer (kotlin-port.md Decision C #2,
-        // which flags this exact pattern in the TS original as something the
-        // port should improve, not replicate uncritically). Draining the
-        // whole stream here before batching is the pragmatic Tier 1 version;
-        // it holds only lightweight (path, blobHash) pairs, never blob
-        // content, so at gitsema's target scale (tens of thousands of blobs)
-        // this is megabytes, not the ~150MB+ vector-materialization problem
-        // §9 exists to solve -- but it is not what "streaming" should mean
-        // long-term. A true fix processes GitRepository.streamBlobs' Flow in
-        // bounded windows without a full upfront collect; tracked as
-        // follow-up work, not silently accepted as done.
+        // Streamed in bounded windows (kotlin-port.md Decision C #2 and
+        // constraint 4, "never buffer entire repo history in memory"): the
+        // walk is pulled [dedupBatchSize] entries at a time and each window is
+        // fully processed before the next is requested, so peak memory is one
+        // window rather than one entry per blob-path pair in history. The
+        // embedding pass therefore also backpressures the git walk instead of
+        // the walk racing ahead of it.
         //
         // Uses effectiveSince (not the raw `since` parameter) so the resume
         // cursor bounds this walk the same way it bounds the commit walk
@@ -166,8 +158,7 @@ class Indexer(
         // ObjectWalk excludes an object only when EVERY path to it runs
         // through commits marked uninteresting, not merely because it also
         // happens to be reachable from old history.
-        val entries = repository.streamBlobs(ref, effectiveSince).toList()
-        for (batch in entries.chunked(dedupBatchSize)) {
+        repository.streamBlobs(ref, effectiveSince).chunked(dedupBatchSize).collect { batch ->
             // Same reasoning as the commit loop above -- checked once per
             // dedupBatchSize chunk (not per blob) to keep the overhead
             // negligible while still bounding how much in-flight work a

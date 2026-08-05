@@ -2,7 +2,11 @@ package io.github.jsilvanus.gitsema.indexing
 
 import io.github.jsilvanus.gitsema.chunking.FileChunker
 import io.github.jsilvanus.gitsema.db.GitsemaDatabase
+import io.github.jsilvanus.gitsema.embedding.EmbeddingProvider
 import io.github.jsilvanus.gitsema.embedding.embed
+import io.github.jsilvanus.gitsema.git.BlobPathEntry
+import io.github.jsilvanus.gitsema.git.GitRepository
+import io.github.jsilvanus.gitsema.model.CommitHash
 import io.github.jsilvanus.gitsema.storage.CommitMeta
 import io.github.jsilvanus.gitsema.storage.FlatFileVectorStore
 import io.github.jsilvanus.gitsema.storage.MetadataStore
@@ -10,8 +14,11 @@ import io.github.jsilvanus.gitsema.storage.SqliteFtsStore
 import io.github.jsilvanus.gitsema.storage.SqliteMetadataStore
 import io.github.jsilvanus.gitsema.storage.createSqlDriver
 import io.github.jsilvanus.gitsema.testutil.FakeEmbeddingProvider
+import io.github.jsilvanus.gitsema.testutil.deterministicVector
 import io.github.jsilvanus.gitsema.testutil.FakeGitRepository
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.After
@@ -65,6 +72,51 @@ class IndexerTest {
             ftsStore = ftsStore,
             chunker = FileChunker(),
         )
+
+
+    @Test
+    fun `the blob walk is streamed in bounded windows, not drained before work starts`() = runTest {
+        // kotlin-port.md Decision C #2 / constraint 4: the indexer must not
+        // buffer the whole walk. The observable difference is when work
+        // starts -- with a drain, every entry is emitted before the first
+        // embed call; streaming starts embedding after one window.
+        val files = (1..20).associate { "file$it.txt" to "unique content number $it" }
+        var emitted = 0
+        var emittedAtFirstEmbed: Int? = null
+
+        val provider = object : EmbeddingProvider {
+            override val modelId = "streaming-probe-model"
+            override val dimensions = 8
+            override suspend fun embed(texts: List<String>): List<FloatArray> {
+                if (emittedAtFirstEmbed == null) emittedAtFirstEmbed = emitted
+                return texts.map { deterministicVector(it, dimensions) }
+            }
+        }
+
+        val delegate = FakeGitRepository(files)
+        val countingRepository = object : GitRepository by delegate {
+            override fun streamBlobs(ref: String, since: CommitHash?): Flow<BlobPathEntry> =
+                delegate.streamBlobs(ref, since).onEach { emitted++ }
+        }
+
+        val indexer = Indexer(
+            repository = countingRepository,
+            provider = provider,
+            metadataStore = metadataStore,
+            vectorStore = vectorStore,
+            ftsStore = ftsStore,
+            chunker = FileChunker(),
+            dedupBatchSize = 5,
+        )
+        val result = indexer.index("HEAD")
+
+        assertEquals(20, result.blobsIndexed, "every blob still gets indexed -- streaming changes when, not whether")
+        assertEquals(
+            5,
+            emittedAtFirstEmbed,
+            "embedding must begin after one dedupBatchSize window (5), not after the whole walk (20) -- a drain would report 20",
+        )
+    }
 
     @Test
     fun `indexes every distinct blob and reports accurate stats`() = runTest {
