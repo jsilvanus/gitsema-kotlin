@@ -142,13 +142,10 @@ sqldelight {
 }
 
 // ---------------------------------------------------------------------------
-// Publishing: GitHub Packages, manual-dispatch only (.github/workflows/publish.yml)
-// — not on every push. Not expected to be used routinely while Tier 1/2 are
-// still in flux; wired now per explicit request so it exists and is correct
-// once there's something worth publishing, rather than being invented later
-// under time pressure. KMP + maven-publish auto-creates one publication per
-// target (currently just "jvm"; androidRelease joins automatically once that
-// target is wired, no changes needed here).
+// Publishing: GitHub Packages. .github/workflows/publish.yml runs on every
+// push to main and publishes a build version, 0.1.0-build.<run>+<sha8>; a
+// manual run can pass an explicit -Pversion. KMP + maven-publish creates one
+// publication per target (jvm and androidRelease).
 // ---------------------------------------------------------------------------
 publishing {
     repositories {
